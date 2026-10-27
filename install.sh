@@ -71,27 +71,39 @@ detect_os() {
 install_packages() {
   log "Installing packages (apt)..."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y -qq; apt-get upgrade -y -qq
+
+  apt-get update -y -qq || die "apt-get update failed"
+  apt-get upgrade -y -qq || warn "apt-get upgrade had issues (continuing)"
+
   PHP_VER="$(apt-cache search --names-only '^php[0-9]+\.[0-9]+-fpm$' | sort -V | tail -1 | awk -F- '{print $1}')"
   [[ -n "$PHP_VER" ]] || PHP_VER="php8.2"
   log "PHP version: $PHP_VER"
 
-  # Core packages — no --no-install-recommends so sqlite3 and nginx helpers come in cleanly
-  apt-get install -y -qq \
-    nginx "$PHP_VER-fpm" "$PHP_VER-cli" "$PHP_VER-sqlite3" "$PHP_VER-curl" \
-    "$PHP_VER-mbstring" "$PHP_VER-xml" "$PHP_VER-intl" "$PHP_VER-opcache" \
-    "$PHP_VER-bcmath" "$PHP_VER-gd" \
-    sqlite3 curl ca-certificates openssl \
-    ufw fail2ban unattended-upgrades apt-listchanges \
-    certbot python3-certbot-nginx \
-    logrotate rsync jq 2>>"$INSTALL_LOG" || true
+  # Core packages — NO error swallowing. If this fails, the script dies with the real message.
+  if ! apt-get install -y -qq \
+      nginx nginx-common \
+      "$PHP_VER-fpm" "$PHP_VER-cli" "$PHP_VER-sqlite3" "$PHP_VER-curl" \
+      "$PHP_VER-mbstring" "$PHP_VER-xml" "$PHP_VER-intl" "$PHP_VER-opcache" \
+      "$PHP_VER-bcmath" "$PHP_VER-gd" \
+      sqlite3 curl ca-certificates openssl \
+      ufw fail2ban unattended-upgrades apt-listchanges \
+      certbot python3-certbot-nginx \
+      logrotate rsync jq; then
+    die "Core package installation failed — see output above"
+  fi
 
-  # Optional Nginx helper modules — tolerate failure on distros without them
+  # Optional Nginx helper modules (failure tolerated)
   apt-get install -y -qq libnginx-mod-http-headers-more-filter libnginx-mod-http-limit-req \
     2>>"$INSTALL_LOG" || warn "Optional nginx modules not installed (non-fatal)"
 
-  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 still missing after package install"
-  ok "Packages installed (sqlite3 OK)"
+  # Post-install sanity checks
+  command -v nginx        >/dev/null 2>&1 || die "nginx binary missing after install"
+  [[ -f /etc/nginx/nginx.conf ]]            || die "/etc/nginx/nginx.conf missing after install"
+  [[ -d /etc/nginx/sites-available ]]       || die "/etc/nginx/sites-available missing after install"
+  command -v sqlite3      >/dev/null 2>&1 || die "sqlite3 CLI missing after install"
+  command -v php          >/dev/null 2>&1 || die "php CLI missing after install"
+
+  ok "Packages installed (nginx + sqlite3 + php verified)"
 }
 
 create_user() {
