@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# LiteForum — Complete One-Shot Installer
+# LiteForum — Complete One-Shot Installer (v2)
 # =============================================================================
 set -Eeuo pipefail
 umask 027
@@ -18,14 +18,8 @@ die()  { printf "\e[31m[FATAL]\e[0m %s\n" "$*" | tee -a "$INSTALL_LOG"; exit 1; 
 
 usage() { cat <<EOT
 LiteForum Installer
-  --domain <fqdn>       Domain
-  --email <mail>        Let's Encrypt + admin contact
-  --admin <mail>        Admin email
-  --lang <tr|en>        Install language
-  --skip-tls            HTTP only
-  --no-firewall         Skip UFW
-  --dry-run             Plan only
-  -h|--help
+  --domain <fqdn>   --email <mail>   --admin <mail>   --lang <tr|en>
+  --skip-tls        --no-firewall    --dry-run        -h|--help
 EOT
 exit 0; }
 
@@ -62,11 +56,8 @@ install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y -qq || die "apt update failed"
   apt-get upgrade -y -qq || warn "upgrade issues (continuing)"
-
   PHP_VER="$(apt-cache search --names-only '^php[0-9]+\.[0-9]+-fpm$' | sort -V | tail -1 | awk -F- '{print $1}')"
   [[ -n "$PHP_VER" ]] || PHP_VER="php8.2"
-  ok "PHP: $PHP_VER"
-
   if ! apt-get install -y -qq \
       nginx nginx-common \
       "$PHP_VER-fpm" "$PHP_VER-cli" "$PHP_VER-sqlite3" "$PHP_VER-curl" \
@@ -74,20 +65,15 @@ install_packages() {
       "$PHP_VER-bcmath" "$PHP_VER-gd" \
       sqlite3 curl ca-certificates openssl \
       ufw fail2ban unattended-upgrades \
-      certbot python3-certbot-nginx \
-      logrotate rsync jq; then
+      certbot python3-certbot-nginx logrotate rsync jq; then
     die "Package install failed"
   fi
-
   apt-get install -y -qq libnginx-mod-http-headers-more-filter libnginx-mod-http-limit-req 2>/dev/null || true
-
   command -v nginx   >/dev/null || die "nginx binary missing"
-  [[ -f /etc/nginx/nginx.conf ]] || die "/etc/nginx/nginx.conf missing"
   command -v sqlite3 >/dev/null || die "sqlite3 missing"
   command -v php     >/dev/null || die "php missing"
-
   install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
-  ok "Packages installed"
+  ok "Packages installed ($PHP_VER)"
 }
 
 create_user() {
@@ -130,19 +116,26 @@ CREATE TABLE users(
   erendev_sub TEXT UNIQUE,
   theme TEXT NOT NULL DEFAULT 'dark' CHECK(theme IN ('dark','light','high-contrast')),
   accent TEXT NOT NULL DEFAULT 'indigo' CHECK(accent IN ('indigo','emerald','rose','amber','sky')),
+  bio TEXT DEFAULT '',
+  avatar_color TEXT DEFAULT '#6366f1',
   notify_mentions INTEGER NOT NULL DEFAULT 1,
   notify_replies INTEGER NOT NULL DEFAULT 1,
   notify_digest INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
+  last_seen_at INTEGER,
   last_login_at INTEGER
 );
+
 CREATE TABLE categories(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   slug TEXT NOT NULL UNIQUE,
   name_tr TEXT NOT NULL, name_en TEXT NOT NULL,
   name_fr TEXT, name_de TEXT, name_es TEXT, name_ar TEXT,
+  description_tr TEXT DEFAULT '', description_en TEXT DEFAULT '',
+  icon TEXT DEFAULT '💬',
   position INTEGER NOT NULL DEFAULT 0
 );
+
 CREATE TABLE topics(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
@@ -150,8 +143,11 @@ CREATE TABLE topics(
   title TEXT NOT NULL, slug TEXT NOT NULL,
   is_pinned INTEGER NOT NULL DEFAULT 0,
   is_locked INTEGER NOT NULL DEFAULT 0,
+  views INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
+CREATE INDEX idx_topics_cat ON topics(category_id, is_pinned DESC, updated_at DESC);
+
 CREATE TABLE posts(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
@@ -159,8 +155,15 @@ CREATE TABLE posts(
   body TEXT NOT NULL,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
-CREATE INDEX idx_topics_cat ON topics(category_id, updated_at DESC);
 CREATE INDEX idx_posts_topic ON posts(topic_id, created_at ASC);
+
+CREATE TABLE post_reactions(
+  post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  emoji TEXT NOT NULL CHECK(emoji IN ('👍','❤️','🔥','😂','😮')),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(post_id, user_id, emoji)
+);
 
 CREATE TABLE rate_limits(id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, ip TEXT NOT NULL, ts INTEGER NOT NULL);
 CREATE INDEX idx_rate ON rate_limits(bucket, ip, ts);
@@ -182,11 +185,17 @@ CREATE TABLE topic_watches(
   created_at INTEGER NOT NULL,
   PRIMARY KEY(user_id, topic_id)
 );
+
 CREATE TABLE audit_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   action TEXT NOT NULL, target_kind TEXT, target_id INTEGER,
   meta TEXT, ip TEXT, ts INTEGER NOT NULL
+);
+
+CREATE TABLE settings(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 
 CREATE VIRTUAL TABLE posts_fts USING fts5(body, content='posts', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
@@ -201,6 +210,7 @@ CREATE TRIGGER posts_ad AFTER DELETE ON posts BEGIN
   INSERT INTO posts_fts(posts_fts,rowid,body) VALUES('delete',old.id,old.body);
 END;
 SQL
+  sqlite3 "$DB" "INSERT INTO settings(key,value) VALUES('app_name','LiteForum'),('app_tagline','A lightweight, modern forum');"
   chown "$SVC_USER:$SVC_USER" "$DB"* 2>/dev/null; chmod 0600 "$DB"* 2>/dev/null
   ok "SQLite: $DB"
 }
@@ -227,7 +237,7 @@ return [
         'scope'         => 'profile email',
         'button_svg'    => 'https://oauth2.erendev.xyz/erendev-login-button.svg',
     ],
-    'rate_limit' => ['login_per_10min'=>8, 'post_per_min'=>6, 'register_per_hr'=>5],
+    'rate_limit' => ['login_per_10min'=>10, 'post_per_min'=>6, 'register_per_hr'=>5, 'react_per_min'=>30],
     'themes'  => ['dark','light','high-contrast'],
     'accents' => ['indigo','emerald','rose','amber','sky'],
     'admin_email' => '$ADMIN_EMAIL',
@@ -242,42 +252,165 @@ write_i18n() {
   cat > "$APP_DIR/lang/tr.php" <<'PHP'
 <?php return [
   'forum'=>'Forum','login'=>'Giriş Yap','register'=>'Kayıt Ol','logout'=>'Çıkış Yap',
-  'username'=>'Kullanıcı adı','email'=>'E-posta','password'=>'Şifre',
-  'categories'=>'Kategoriler','topics'=>'Konular','posts'=>'Mesajlar',
+  'username'=>'Kullanıcı adı','email'=>'E-posta','password'=>'Şifre','bio'=>'Hakkında',
+  'categories'=>'Kategoriler','topics'=>'Konular','posts'=>'Mesajlar','views'=>'Görüntüleme',
   'new_topic'=>'Yeni Konu','reply'=>'Yanıtla','search'=>'Ara...','submit'=>'Gönder',
   'notifications'=>'Bildirimler','mark_all_read'=>'Tümünü okundu işaretle','no_notifications'=>'Bildirim yok',
   'watch_topic'=>'Konuyu takip et','unwatch_topic'=>'Takibi bırak',
   'theme'=>'Tema','accent'=>'Vurgu rengi','settings'=>'Ayarlar','save'=>'Kaydet',
   'search_results'=>'Arama sonuçları','no_results'=>'Sonuç yok','search_placeholder'=>'Ara...',
+  'home'=>'Ana Sayfa','activity'=>'Son Aktivite','stats'=>'İstatistikler','profile'=>'Profil',
+  'recent_topics'=>'Son Konular','latest_posts'=>'Son Mesajlar','online_users'=>'Çevrimiçi',
+  'members'=>'Üyeler','total_topics'=>'Konular','total_posts'=>'Mesajlar','total_users'=>'Üyeler',
+  'joined'=>'Katılım','last_seen'=>'Son görülme','reply_to_topic'=>'Konuya yanıt ver',
+  'title'=>'Başlık','body'=>'İçerik','post_reply'=>'Yanıtla','back'=>'Geri',
   'erendev_login'=>'ErenDev ile Giriş Yap',
   'too_many_attempts'=>'Çok fazla deneme.','missing_info'=>'Eksik bilgi.',
   'bad_credentials'=>'E-posta veya şifre hatalı.','bot_detected'=>'Bot tespit edildi.',
   'register_limit'=>'Kayıt limiti aşıldı.','bad_username'=>'Kullanıcı adı 3-32 karakter olmalı.',
   'bad_email'=>'Geçerli e-posta girin.','weak_password'=>'Şifre en az 10 karakter.',
-  'already_exists'=>'Zaten kayıtlı.',
+  'already_exists'=>'Zaten kayıtlı.','saved'=>'Kaydedildi.','not_found'=>'Bulunamadı.',
+  'settings_saved'=>'Ayarlar kaydedildi.','profile_updated'=>'Profil güncellendi.',
+  'site_name'=>'Site adı','site_tagline'=>'Site sloganı','admin_settings'=>'Site Ayarları',
+  'admin_users'=>'Kullanıcılar','admin_audit'=>'Denetim Kaydı','roles'=>'Roller',
+  'no_topics_yet'=>'Henüz konu yok.','loading'=>'Yükleniyor...','delete'=>'Sil',
 ];
 PHP
   cat > "$APP_DIR/lang/en.php" <<'PHP'
 <?php return [
   'forum'=>'Forum','login'=>'Log in','register'=>'Sign up','logout'=>'Log out',
-  'username'=>'Username','email'=>'Email','password'=>'Password',
-  'categories'=>'Categories','topics'=>'Topics','posts'=>'Posts',
+  'username'=>'Username','email'=>'Email','password'=>'Password','bio'=>'Bio',
+  'categories'=>'Categories','topics'=>'Topics','posts'=>'Posts','views'=>'Views',
   'new_topic'=>'New topic','reply'=>'Reply','search'=>'Search...','submit'=>'Submit',
   'notifications'=>'Notifications','mark_all_read'=>'Mark all as read','no_notifications'=>'No notifications',
   'watch_topic'=>'Watch topic','unwatch_topic'=>'Unwatch',
   'theme'=>'Theme','accent'=>'Accent color','settings'=>'Settings','save'=>'Save',
   'search_results'=>'Search results','no_results'=>'No results','search_placeholder'=>'Search...',
+  'home'=>'Home','activity'=>'Activity','stats'=>'Statistics','profile'=>'Profile',
+  'recent_topics'=>'Recent Topics','latest_posts'=>'Latest Posts','online_users'=>'Online',
+  'members'=>'Members','total_topics'=>'Topics','total_posts'=>'Posts','total_users'=>'Members',
+  'joined'=>'Joined','last_seen'=>'Last seen','reply_to_topic'=>'Reply to topic',
+  'title'=>'Title','body'=>'Body','post_reply'=>'Reply','back'=>'Back',
   'erendev_login'=>'Sign in with ErenDev',
   'too_many_attempts'=>'Too many attempts.','missing_info'=>'Missing information.',
   'bad_credentials'=>'Incorrect email or password.','bot_detected'=>'Bot detected.',
   'register_limit'=>'Registration limit exceeded.','bad_username'=>'Username must be 3-32 chars.',
   'bad_email'=>'Enter a valid email.','weak_password'=>'Password min 10 chars.',
-  'already_exists'=>'Already registered.',
+  'already_exists'=>'Already registered.','saved'=>'Saved.','not_found'=>'Not found.',
+  'settings_saved'=>'Settings saved.','profile_updated'=>'Profile updated.',
+  'site_name'=>'Site name','site_tagline'=>'Site tagline','admin_settings'=>'Site Settings',
+  'admin_users'=>'Users','admin_audit'=>'Audit Log','roles'=>'Roles',
+  'no_topics_yet'=>'No topics yet.','loading'=>'Loading...','delete'=>'Delete',
 ];
 PHP
-  for lc in fr de es ar; do
-    cp "$APP_DIR/lang/en.php" "$APP_DIR/lang/$lc.php"
-  done
+  cat > "$APP_DIR/lang/fr.php" <<'PHP'
+<?php return [
+  'forum'=>'Forum','login'=>'Se connecter','register'=>"S'inscrire",'logout'=>'Se déconnecter',
+  'username'=>"Nom d'utilisateur",'email'=>'E-mail','password'=>'Mot de passe','bio'=>'Bio',
+  'categories'=>'Catégories','topics'=>'Sujets','posts'=>'Messages','views'=>'Vues',
+  'new_topic'=>'Nouveau sujet','reply'=>'Répondre','search'=>'Rechercher...','submit'=>'Envoyer',
+  'notifications'=>'Notifications','mark_all_read'=>'Tout marquer comme lu','no_notifications'=>'Aucune notification',
+  'watch_topic'=>'Suivre','unwatch_topic'=>'Ne plus suivre',
+  'theme'=>'Thème','accent'=>"Couleur d'accent",'settings'=>'Paramètres','save'=>'Enregistrer',
+  'search_results'=>'Résultats','no_results'=>'Aucun résultat','search_placeholder'=>'Rechercher...',
+  'home'=>'Accueil','activity'=>'Activité','stats'=>'Statistiques','profile'=>'Profil',
+  'recent_topics'=>'Sujets récents','latest_posts'=>'Messages récents','online_users'=>'En ligne',
+  'members'=>'Membres','total_topics'=>'Sujets','total_posts'=>'Messages','total_users'=>'Membres',
+  'joined'=>'Inscrit','last_seen'=>'Vu','reply_to_topic'=>'Répondre',
+  'title'=>'Titre','body'=>'Contenu','post_reply'=>'Répondre','back'=>'Retour',
+  'erendev_login'=>'Se connecter avec ErenDev',
+  'too_many_attempts'=>'Trop de tentatives.','missing_info'=>'Informations manquantes.',
+  'bad_credentials'=>'E-mail ou mot de passe incorrect.','bot_detected'=>'Bot détecté.',
+  'register_limit'=>"Limite d'inscription atteinte.",'bad_username'=>"Nom d'utilisateur 3-32 caractères.",
+  'bad_email'=>'E-mail invalide.','weak_password'=>'Mot de passe min 10 caractères.',
+  'already_exists'=>'Déjà inscrit.','saved'=>'Enregistré.','not_found'=>'Introuvable.',
+  'settings_saved'=>'Paramètres enregistrés.','profile_updated'=>'Profil mis à jour.',
+  'site_name'=>'Nom du site','site_tagline'=>'Slogan','admin_settings'=>'Paramètres du site',
+  'admin_users'=>'Utilisateurs','admin_audit'=>'Journal','roles'=>'Rôles',
+  'no_topics_yet'=>'Aucun sujet.','loading'=>'Chargement...','delete'=>'Supprimer',
+];
+PHP
+  cat > "$APP_DIR/lang/de.php" <<'PHP'
+<?php return [
+  'forum'=>'Forum','login'=>'Anmelden','register'=>'Registrieren','logout'=>'Abmelden',
+  'username'=>'Benutzername','email'=>'E-Mail','password'=>'Passwort','bio'=>'Über mich',
+  'categories'=>'Kategorien','topics'=>'Themen','posts'=>'Beiträge','views'=>'Aufrufe',
+  'new_topic'=>'Neues Thema','reply'=>'Antworten','search'=>'Suchen...','submit'=>'Absenden',
+  'notifications'=>'Benachrichtigungen','mark_all_read'=>'Alle als gelesen markieren','no_notifications'=>'Keine Benachrichtigungen',
+  'watch_topic'=>'Beobachten','unwatch_topic'=>'Nicht mehr beobachten',
+  'theme'=>'Design','accent'=>'Akzentfarbe','settings'=>'Einstellungen','save'=>'Speichern',
+  'search_results'=>'Suchergebnisse','no_results'=>'Keine Ergebnisse','search_placeholder'=>'Suchen...',
+  'home'=>'Startseite','activity'=>'Aktivität','stats'=>'Statistik','profile'=>'Profil',
+  'recent_topics'=>'Neueste Themen','latest_posts'=>'Neueste Beiträge','online_users'=>'Online',
+  'members'=>'Mitglieder','total_topics'=>'Themen','total_posts'=>'Beiträge','total_users'=>'Mitglieder',
+  'joined'=>'Beigetreten','last_seen'=>'Zuletzt gesehen','reply_to_topic'=>'Antworten',
+  'title'=>'Titel','body'=>'Inhalt','post_reply'=>'Antworten','back'=>'Zurück',
+  'erendev_login'=>'Mit ErenDev anmelden',
+  'too_many_attempts'=>'Zu viele Versuche.','missing_info'=>'Fehlende Angaben.',
+  'bad_credentials'=>'E-Mail oder Passwort falsch.','bot_detected'=>'Bot erkannt.',
+  'register_limit'=>'Registrierungslimit erreicht.','bad_username'=>'Benutzername 3-32 Zeichen.',
+  'bad_email'=>'Ungültige E-Mail.','weak_password'=>'Passwort min 10 Zeichen.',
+  'already_exists'=>'Bereits registriert.','saved'=>'Gespeichert.','not_found'=>'Nicht gefunden.',
+  'settings_saved'=>'Einstellungen gespeichert.','profile_updated'=>'Profil aktualisiert.',
+  'site_name'=>'Seitenname','site_tagline'=>'Slogan','admin_settings'=>'Seiteneinstellungen',
+  'admin_users'=>'Benutzer','admin_audit'=>'Audit-Protokoll','roles'=>'Rollen',
+  'no_topics_yet'=>'Noch keine Themen.','loading'=>'Lädt...','delete'=>'Löschen',
+];
+PHP
+  cat > "$APP_DIR/lang/es.php" <<'PHP'
+<?php return [
+  'forum'=>'Foro','login'=>'Iniciar sesión','register'=>'Registrarse','logout'=>'Cerrar sesión',
+  'username'=>'Usuario','email'=>'Correo','password'=>'Contraseña','bio'=>'Biografía',
+  'categories'=>'Categorías','topics'=>'Temas','posts'=>'Mensajes','views'=>'Vistas',
+  'new_topic'=>'Nuevo tema','reply'=>'Responder','search'=>'Buscar...','submit'=>'Enviar',
+  'notifications'=>'Notificaciones','mark_all_read'=>'Marcar todo como leído','no_notifications'=>'Sin notificaciones',
+  'watch_topic'=>'Seguir tema','unwatch_topic'=>'Dejar de seguir',
+  'theme'=>'Tema','accent'=>'Color de acento','settings'=>'Ajustes','save'=>'Guardar',
+  'search_results'=>'Resultados','no_results'=>'Sin resultados','search_placeholder'=>'Buscar...',
+  'home'=>'Inicio','activity'=>'Actividad','stats'=>'Estadísticas','profile'=>'Perfil',
+  'recent_topics'=>'Temas recientes','latest_posts'=>'Últimos mensajes','online_users'=>'En línea',
+  'members'=>'Miembros','total_topics'=>'Temas','total_posts'=>'Mensajes','total_users'=>'Miembros',
+  'joined'=>'Registrado','last_seen'=>'Visto','reply_to_topic'=>'Responder',
+  'title'=>'Título','body'=>'Contenido','post_reply'=>'Responder','back'=>'Volver',
+  'erendev_login'=>'Iniciar sesión con ErenDev',
+  'too_many_attempts'=>'Demasiados intentos.','missing_info'=>'Información incompleta.',
+  'bad_credentials'=>'Correo o contraseña incorrectos.','bot_detected'=>'Bot detectado.',
+  'register_limit'=>'Límite de registro alcanzado.','bad_username'=>'Usuario 3-32 caracteres.',
+  'bad_email'=>'Correo inválido.','weak_password'=>'Contraseña min 10 caracteres.',
+  'already_exists'=>'Ya registrado.','saved'=>'Guardado.','not_found'=>'No encontrado.',
+  'settings_saved'=>'Ajustes guardados.','profile_updated'=>'Perfil actualizado.',
+  'site_name'=>'Nombre del sitio','site_tagline'=>'Lema','admin_settings'=>'Ajustes del sitio',
+  'admin_users'=>'Usuarios','admin_audit'=>'Registro de auditoría','roles'=>'Roles',
+  'no_topics_yet'=>'Sin temas aún.','loading'=>'Cargando...','delete'=>'Eliminar',
+];
+PHP
+  cat > "$APP_DIR/lang/ar.php" <<'PHP'
+<?php return [
+  'forum'=>'المنتدى','login'=>'تسجيل الدخول','register'=>'إنشاء حساب','logout'=>'تسجيل الخروج',
+  'username'=>'اسم المستخدم','email'=>'البريد الإلكتروني','password'=>'كلمة المرور','bio'=>'نبذة',
+  'categories'=>'الأقسام','topics'=>'المواضيع','posts'=>'المنشورات','views'=>'المشاهدات',
+  'new_topic'=>'موضوع جديد','reply'=>'رد','search'=>'بحث...','submit'=>'إرسال',
+  'notifications'=>'الإشعارات','mark_all_read'=>'تحديد الكل كمقروء','no_notifications'=>'لا توجد إشعارات',
+  'watch_topic'=>'متابعة','unwatch_topic'=>'إلغاء المتابعة',
+  'theme'=>'المظهر','accent'=>'لون التمييز','settings'=>'الإعدادات','save'=>'حفظ',
+  'search_results'=>'نتائج البحث','no_results'=>'لا نتائج','search_placeholder'=>'بحث...',
+  'home'=>'الرئيسية','activity'=>'النشاط','stats'=>'الإحصاءات','profile'=>'الملف الشخصي',
+  'recent_topics'=>'المواضيع الأخيرة','latest_posts'=>'أحدث المنشورات','online_users'=>'متصل الآن',
+  'members'=>'الأعضاء','total_topics'=>'المواضيع','total_posts'=>'المنشورات','total_users'=>'الأعضاء',
+  'joined'=>'تاريخ الانضمام','last_seen'=>'آخر ظهور','reply_to_topic'=>'رد على الموضوع',
+  'title'=>'العنوان','body'=>'المحتوى','post_reply'=>'رد','back'=>'رجوع',
+  'erendev_login'=>'تسجيل الدخول عبر ErenDev',
+  'too_many_attempts'=>'محاولات كثيرة.','missing_info'=>'معلومات ناقصة.',
+  'bad_credentials'=>'البريد أو كلمة المرور غير صحيحة.','bot_detected'=>'تم رصد روبوت.',
+  'register_limit'=>'تم تجاوز حد التسجيل.','bad_username'=>'اسم المستخدم 3-32 حرفًا.',
+  'bad_email'=>'بريد غير صالح.','weak_password'=>'كلمة المرور 10 أحرف على الأقل.',
+  'already_exists'=>'مسجل بالفعل.','saved'=>'تم الحفظ.','not_found'=>'غير موجود.',
+  'settings_saved'=>'تم حفظ الإعدادات.','profile_updated'=>'تم تحديث الملف.',
+  'site_name'=>'اسم الموقع','site_tagline'=>'شعار الموقع','admin_settings'=>'إعدادات الموقع',
+  'admin_users'=>'المستخدمون','admin_audit'=>'سجل التدقيق','roles'=>'الأدوار',
+  'no_topics_yet'=>'لا مواضيع بعد.','loading'=>'جار التحميل...','delete'=>'حذف',
+];
+PHP
   chown -R root:root "$APP_DIR/lang"; chmod 0644 "$APP_DIR/lang"/*.php
   ok "i18n"
 }
@@ -296,6 +429,11 @@ require LF_ROOT . '/app/helpers.php';
 require LF_ROOT . '/app/notifications.php';
 require LF_ROOT . '/app/search.php';
 require LF_ROOT . '/app/theme.php';
+require LF_ROOT . '/app/settings.php';
+require LF_ROOT . '/app/flash.php';
+require LF_ROOT . '/app/markdown.php';
+require LF_ROOT . '/app/avatar.php';
+require LF_ROOT . '/app/activity.php';
 
 session_name($config['session_name']);
 session_set_cookie_params([
@@ -313,6 +451,13 @@ csrf_init($config['app_key']);
 $db = db_init($config['db_path']);
 $GLOBALS['__config'] = $config;
 $GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
+$GLOBALS['__app_name'] = settings_get($db, 'app_name', 'LiteForum');
+$GLOBALS['__app_tagline'] = settings_get($db, 'app_tagline', '');
+
+// Mark current user as online (last_seen_at)
+if (!empty($_SESSION['user']['id'])) {
+  $db->prepare('UPDATE users SET last_seen_at=? WHERE id=?')->execute([time(), (int)$_SESSION['user']['id']]);
+}
 PHP
 
   cat > "$APP_DIR/app/db.php" <<'PHP'
@@ -350,6 +495,22 @@ function audit(PDO $db, ?array $actor, string $action, ?string $kind=null, ?int 
   $db->prepare('INSERT INTO audit_log(actor_id,action,target_kind,target_id,meta,ip,ts) VALUES(?,?,?,?,?,?,?)')
      ->execute([$actor['id']??null, $action, $kind, $id, json_encode($meta), client_ip(), time()]);
 }
+function time_ago(int $ts): string {
+  $d = time() - $ts;
+  if ($d < 60) return $d . 's';
+  if ($d < 3600) return floor($d/60) . 'm';
+  if ($d < 86400) return floor($d/3600) . 'h';
+  if ($d < 2592000) return floor($d/86400) . 'd';
+  return date('Y-m-d', $ts);
+}
+function cat_name(array $cat, string $lc): string {
+  $k = 'name_' . $lc;
+  return $cat[$k] ?? $cat['name_en'] ?? $cat['name_tr'] ?? '';
+}
+function cat_desc(array $cat, string $lc): string {
+  $k = 'description_' . $lc;
+  return $cat[$k] ?? $cat['description_en'] ?? '';
+}
 PHP
 
   cat > "$APP_DIR/app/csrf.php" <<'PHP'
@@ -368,12 +529,24 @@ PHP
 <?php
 declare(strict_types=1);
 function auth_user(): ?array { return $_SESSION['user'] ?? null; }
-function auth_require(): array { $u=auth_user(); if (!$u) redirect('/login.php'); return $u; }
+function auth_require(): array { $u=auth_user(); if (!$u) redirect('/login.php?next=' . urlencode($_SERVER['REQUEST_URI'] ?? '/')); return $u; }
 function auth_admin(): array { $u=auth_require(); if ($u['role']!=='admin') { http_response_code(403); exit('Forbidden'); } return $u; }
 function auth_login(array $u): void {
   session_regenerate_id(true);
-  $_SESSION['user']=['id'=>(int)$u['id'],'username'=>$u['username'],'role'=>$u['role']];
-  $GLOBALS['db']->prepare('UPDATE users SET last_login_at=? WHERE id=?')->execute([time(),(int)$u['id']]);
+  $_SESSION['user'] = [
+    'id' => (int)$u['id'],
+    'username' => $u['username'],
+    'role' => $u['role'],
+    'theme' => $u['theme'] ?? 'dark',
+    'accent' => $u['accent'] ?? 'indigo',
+    'bio' => $u['bio'] ?? '',
+    'avatar_color' => $u['avatar_color'] ?? '#6366f1',
+    'notify_mentions' => (int)($u['notify_mentions'] ?? 1),
+    'notify_replies' => (int)($u['notify_replies'] ?? 1),
+    'notify_digest' => (int)($u['notify_digest'] ?? 0),
+  ];
+  $GLOBALS['db']->prepare('UPDATE users SET last_login_at=?, last_seen_at=? WHERE id=?')
+                ->execute([time(), time(), (int)$u['id']]);
 }
 function auth_logout(): void {
   $_SESSION=[];
@@ -405,23 +578,23 @@ PHP
 declare(strict_types=1);
 function theme_css_vars(): string {
   $u = $_SESSION['user'] ?? null;
-  $theme  = $u['theme']  ?? 'dark';
-  $accent = $u['accent'] ?? 'indigo';
+  $theme  = $u['theme']  ?? ($_SESSION['theme']  ?? 'dark');
+  $accent = $u['accent'] ?? ($_SESSION['accent'] ?? 'indigo');
   $map = [
-    'indigo'  => ['500'=>'#6366f1','600'=>'#4f46e5','400'=>'#818cf8'],
-    'emerald' => ['500'=>'#10b981','600'=>'#059669','400'=>'#34d399'],
-    'rose'    => ['500'=>'#f43f5e','600'=>'#e11d48','400'=>'#fb7185'],
-    'amber'   => ['500'=>'#f59e0b','600'=>'#d97706','400'=>'#fbbf24'],
-    'sky'     => ['500'=>'#0ea5e9','600'=>'#0284c7','400'=>'#38bdf8'],
+    'indigo'  => ['500'=>'#6366f1','600'=>'#4f46e5','400'=>'#818cf8','glow'=>'rgba(79,70,229,.25)'],
+    'emerald' => ['500'=>'#10b981','600'=>'#059669','400'=>'#34d399','glow'=>'rgba(16,185,129,.25)'],
+    'rose'    => ['500'=>'#f43f5e','600'=>'#e11d48','400'=>'#fb7185','glow'=>'rgba(244,63,94,.25)'],
+    'amber'   => ['500'=>'#f59e0b','600'=>'#d97706','400'=>'#fbbf24','glow'=>'rgba(245,158,11,.25)'],
+    'sky'     => ['500'=>'#0ea5e9','600'=>'#0284c7','400'=>'#38bdf8','glow'=>'rgba(14,165,233,.25)'],
   ];
   $c = $map[$accent] ?? $map['indigo'];
   if ($theme === 'light') {
-    return "--bg:#f8fafc;--fg:#0f172a;--panel:#ffffff;--border:#e2e8f0;--accent-500:{$c['500']};--accent-600:{$c['600']};--accent-400:{$c['400']};color-scheme:light;";
+    return "--bg:#f8fafc;--bg2:#f1f5f9;--fg:#0f172a;--fg-muted:#64748b;--panel:#ffffff;--panel2:#f8fafc;--border:#e2e8f0;--accent-500:{$c['500']};--accent-600:{$c['600']};--accent-400:{$c['400']};--glow:{$c['glow']};color-scheme:light;";
   }
   if ($theme === 'high-contrast') {
-    return "--bg:#000000;--fg:#ffffff;--panel:#0a0a0a;--border:#404040;--accent-500:#ffff00;--accent-600:#ffff00;--accent-400:#ffff00;color-scheme:dark;";
+    return "--bg:#000000;--bg2:#0a0a0a;--fg:#ffffff;--fg-muted:#a3a3a3;--panel:#0a0a0a;--panel2:#111;--border:#404040;--accent-500:#ffff00;--accent-600:#ffff00;--accent-400:#ffff00;--glow:rgba(255,255,0,.15);color-scheme:dark;";
   }
-  return "--bg:#020617;--fg:#cbd5e1;--panel:rgba(15,23,42,.6);--border:#1e293b;--accent-500:{$c['500']};--accent-600:{$c['600']};--accent-400:{$c['400']};color-scheme:dark;";
+  return "--bg:#020617;--bg2:#0a0f1e;--fg:#e2e8f0;--fg-muted:#94a3b8;--panel:rgba(15,23,42,.65);--panel2:rgba(30,41,59,.5);--border:#1e293b;--accent-500:{$c['500']};--accent-600:{$c['600']};--accent-400:{$c['400']};--glow:{$c['glow']};color-scheme:dark;";
 }
 PHP
 
@@ -476,136 +649,462 @@ function search_posts(PDO $db, string $q, ?int $categoryId=null, ?int $authorId=
           WHERE posts_fts MATCH ?';
   $params = [$q];
   if ($categoryId) { $sql .= ' AND t.category_id = ?'; $params[] = $categoryId; }
-  if ($authorId)   { $sql .= ' AND p.user_id = ?'; $params[] = $authorId; }
+  if ($authorId)   { $sql .= ' AND p.user_id = ?';     $params[] = $authorId; }
   $sql .= ' ORDER BY rank LIMIT ? OFFSET ?';
   $params[] = $per; $params[] = max(0, ($page-1)*$per);
   $st = $db->prepare($sql);
   try { $st->execute($params); } catch (PDOException $e) { return ['rows'=>[], 'total'=>0]; }
-  return ['rows'=>$st->fetchAll(), 'total'=>count($st->fetchAll())];
+  $rows = $st->fetchAll();
+  $csql = 'SELECT COUNT(*) FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN topics t ON t.id=p.topic_id WHERE posts_fts MATCH ?';
+  $cparams = [$q];
+  if ($categoryId) { $csql .= ' AND t.category_id = ?'; $cparams[] = $categoryId; }
+  if ($authorId)   { $csql .= ' AND p.user_id = ?';     $cparams[] = $authorId; }
+  $cst = $db->prepare($csql); $cst->execute($cparams);
+  return ['rows'=>$rows, 'total'=>(int)$cst->fetchColumn()];
 }
 PHP
+
+  cat > "$APP_DIR/app/settings.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function settings_get(PDO $db, string $key, string $default=''): string {
+  static $cache = [];
+  if (isset($cache[$key])) return $cache[$key];
+  $st = $db->prepare('SELECT value FROM settings WHERE key=?');
+  $st->execute([$key]);
+  $v = $st->fetchColumn();
+  $cache[$key] = $v !== false ? (string)$v : $default;
+  return $cache[$key];
+}
+function settings_set(PDO $db, string $key, string $value): void {
+  $db->prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+     ->execute([$key, $value]);
+  $GLOBALS['__app_name'] = settings_get($db, 'app_name', 'LiteForum');
+}
+PHP
+
+  cat > "$APP_DIR/app/flash.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function flash_set(string $type, string $msg): void {
+  $_SESSION['flash'] = ['type'=>$type, 'msg'=>$msg, 'ts'=>time()];
+}
+function flash_get(): ?array {
+  if (empty($_SESSION['flash'])) return null;
+  $f = $_SESSION['flash'];
+  unset($_SESSION['flash']);
+  return (time() - $f['ts']) < 10 ? $f : null;
+}
+PHP
+
+  cat > "$APP_DIR/app/markdown.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function render_post(string $body): string {
+  $html = e($body);
+  $html = preg_replace('/&gt; (.*)/u', '<blockquote style="border-left:3px solid var(--accent-500);padding-left:.75rem;color:var(--fg-muted);margin:.5rem 0">$1</blockquote>', $html);
+  $html = preg_replace('/\*\*([^*]+)\*\*/u', '<strong>$1</strong>', $html);
+  $html = preg_replace('/(?<!\*)\*([^*]+)\*(?!\*)/u', '<em>$1</em>', $html);
+  $html = preg_replace('/`([^`]+)`/u', '<code style="background:var(--bg2);padding:1px 5px;border-radius:4px">$1</code>', $html);
+  $html = preg_replace('/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/u', '<a href="$2" rel="noopener nofollow" target="_blank">$1</a>', $html);
+  $html = preg_replace('/@([A-Za-z0-9_\-]{3,32})/u', '<a href="/user.php?u=$1" style="background:var(--accent-500);color:#fff;padding:1px 6px;border-radius:4px;font-size:.85em">@$1</a>', $html);
+  return $html;
+}
+PHP
+
+  cat > "$APP_DIR/app/avatar.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function user_avatar(string $username, string $color='#6366f1', int $size=32): string {
+  $initial = mb_strtoupper(mb_substr($username, 0, 1));
+  $c = e($color);
+  $s = (int)$size;
+  $f = (int)($s * 0.45);
+  return "<span style=\"display:inline-flex;align-items:center;justify-content:center;width:{$s}px;height:{$s}px;border-radius:50%;background:linear-gradient(135deg,{$c},{$c}99);color:#fff;font-weight:700;font-size:{$f}px;flex-shrink:0\">{$initial}</span>";
+}
+PHP
+
+  cat > "$APP_DIR/app/activity.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function online_count(PDO $db): int {
+  $st = $db->query('SELECT COUNT(*) FROM users WHERE last_seen_at > ' . (time() - 900));
+  return (int)$st->fetchColumn();
+}
+function recent_topics(PDO $db, int $limit=10): array {
+  $st = $db->prepare('SELECT t.*, u.username, c.slug AS cat_slug,
+    (SELECT COUNT(*) FROM posts p WHERE p.topic_id=t.id) AS post_count
+    FROM topics t JOIN users u ON u.id=t.user_id JOIN categories c ON c.id=t.category_id
+    ORDER BY t.updated_at DESC LIMIT ?');
+  $st->execute([$limit]);
+  return $st->fetchAll();
+}
+function recent_posts(PDO $db, int $limit=10): array {
+  $st = $db->prepare('SELECT p.*, u.username, t.title AS topic_title, t.id AS topic_id
+    FROM posts p JOIN users u ON u.id=p.user_id JOIN topics t ON t.id=p.topic_id
+    ORDER BY p.created_at DESC LIMIT ?');
+  $st->execute([$limit]);
+  return $st->fetchAll();
+}
+function forum_stats(PDO $db): array {
+  return [
+    'topics' => (int)$db->query('SELECT COUNT(*) FROM topics')->fetchColumn(),
+    'posts'  => (int)$db->query('SELECT COUNT(*) FROM posts')->fetchColumn(),
+    'users'  => (int)$db->query('SELECT COUNT(*) FROM users')->fetchColumn(),
+    'online' => online_count($db),
+    'newest' => $db->query('SELECT username, created_at FROM users ORDER BY id DESC LIMIT 1')->fetch() ?: null,
+  ];
+}
+PHP
+
   chown -R root:root "$APP_DIR/app"; chmod -R 0755 "$APP_DIR/app"
   ok "app/"
 }
 
 write_views() {
   cat > "$APP_DIR/views/layout.php" <<'PHP'
-<?php /* @var string $content @var string $title */ $u = auth_user(); ?>
+<?php /* @var string $content @var string $title */
+$u = auth_user();
+$appName = $GLOBALS['__app_name'] ?? 'LiteForum';
+$appTagline = $GLOBALS['__app_tagline'] ?? '';
+$flash = flash_get();
+$unread = $u ? notif_unread_count($GLOBALS['db'],(int)$u['id']) : 0;
+$online = online_count($GLOBALS['db']);
+?>
 <!doctype html>
 <html lang="<?= e($_SESSION['ui_lang'] ?? 'tr') ?>" dir="<?= ($_SESSION['ui_lang'] ?? 'tr')==='ar'?'rtl':'ltr' ?>">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?= e($title ?? 'LiteForum') ?> · LiteForum</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><?= e($title ?? $appName) ?> · <?= e($appName) ?></title>
 <style nonce="<?= e(csp_nonce()) ?>">
   :root { <?= theme_css_vars() ?> }
-  body{background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;margin:0;min-height:100vh}
-  a{color:var(--accent-400);text-decoration:none}a:hover{text-decoration:underline}
-  .container{max-width:1100px;margin:0 auto;padding:2rem 1.25rem}
-  .glass{background:var(--panel);backdrop-filter:blur(8px);border:1px solid var(--border);border-radius:1rem;box-shadow:0 25px 50px -12px rgba(0,0,0,.6)}
-  header.nav{position:sticky;top:0;z-index:10;border-bottom:1px solid var(--border);background:var(--panel);backdrop-filter:blur(8px)}
-  header.nav .inner{max-width:1100px;margin:0 auto;padding:1rem 1.25rem;display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap}
-  .logo{display:flex;gap:.5rem;align-items:center;color:var(--fg);font-weight:600}
-  .logo .mark{width:32px;height:32px;border-radius:.5rem;background:var(--accent-500);display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff}
-  input,textarea,select{background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:.5rem;padding:.55rem .75rem;width:100%;box-sizing:border-box;font:inherit}
-  button,.btn{background:var(--accent-500);color:#fff;border:0;border-radius:.5rem;padding:.6rem 1rem;cursor:pointer;font-weight:600}
-  button:hover,.btn:hover{background:var(--accent-600)}
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;min-height:100vh;line-height:1.55;overflow-x:hidden}
+  body::before{content:"";position:fixed;top:-200px;left:50%;transform:translateX(-50%);width:1000px;height:600px;background:radial-gradient(circle,var(--glow),transparent 70%);pointer-events:none;z-index:0;animation:float 12s ease-in-out infinite}
+  body::after{content:"";position:fixed;inset:0;background-image:radial-gradient(var(--border) 1px,transparent 1px);background-size:32px 32px;opacity:.4;pointer-events:none;z-index:0}
+  @keyframes float{0%,100%{transform:translateX(-50%) translateY(0)}50%{transform:translateX(-50%) translateY(-30px)}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes slideDown{from{opacity:0;transform:translateY(-20px)}to{opacity:1;transform:translateY(0)}}
+  a{color:var(--accent-400);text-decoration:none;transition:color .15s}
+  a:hover{color:var(--accent-500);text-decoration:underline}
+  .container{max-width:1160px;margin:0 auto;padding:2rem 1.25rem;position:relative;z-index:1}
+  .glass{background:var(--panel);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border);border-radius:1rem;box-shadow:0 25px 50px -12px rgba(0,0,0,.4);transition:transform .2s ease,border-color .2s,box-shadow .2s}
+  .glass:hover{border-color:color-mix(in srgb,var(--accent-500) 30%,var(--border));box-shadow:0 25px 50px -12px var(--glow)}
+  .card{padding:1.75rem}
+  .card-lift{transition:transform .2s ease,box-shadow .2s}
+  .card-lift:hover{transform:translateY(-3px);box-shadow:0 30px 60px -15px var(--glow)}
+  header.nav{position:sticky;top:0;z-index:50;border-bottom:1px solid var(--border);background:color-mix(in srgb,var(--bg) 80%,transparent);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+  header.nav .inner{max-width:1160px;margin:0 auto;padding:.9rem 1.25rem;display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap}
+  .logo{display:flex;gap:.6rem;align-items:center;color:var(--fg);font-weight:700;font-size:1.1rem;letter-spacing:-.02em}
+  .logo .mark{width:34px;height:34px;border-radius:.6rem;background:linear-gradient(135deg,var(--accent-500),var(--accent-600));display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:1rem;box-shadow:0 4px 12px var(--glow)}
+  nav.actions{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+  nav.actions a,nav.actions button{padding:.45rem .75rem;border-radius:.55rem;font-size:.9rem;transition:all .15s}
+  nav.actions a:hover{background:var(--panel2);color:var(--fg);text-decoration:none}
+  nav.actions .icon-link{position:relative;padding:.45rem .55rem}
+  .badge-notif{position:absolute;top:-2px;right:-2px;background:#ef4444;color:#fff;border-radius:999px;font-size:10px;font-weight:700;min-width:16px;height:16px;display:flex;align-items:center;justify-content:center;padding:0 4px;box-shadow:0 0 0 2px var(--bg)}
+  input,textarea,select{background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:.55rem;padding:.65rem .85rem;width:100%;font:inherit;font-size:.95rem;transition:border-color .15s,box-shadow .15s}
+  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent-500);box-shadow:0 0 0 3px var(--glow)}
+  textarea{resize:vertical;min-height:100px;font-family:inherit}
+  button,.btn{background:linear-gradient(135deg,var(--accent-500),var(--accent-600));color:#fff;border:0;border-radius:.55rem;padding:.65rem 1.1rem;cursor:pointer;font-weight:600;font-size:.95rem;transition:transform .1s,filter .15s,box-shadow .2s;position:relative}
+  button:hover,.btn:hover{filter:brightness(1.1);box-shadow:0 8px 20px -4px var(--glow)}
+  button:active,.btn:active{transform:translateY(1px)}
+  button:disabled{opacity:.5;cursor:not-allowed;filter:none}
   .btn-ghost{background:transparent;border:1px solid var(--border);color:var(--fg)}
-  .muted{color:#94a3b8}.card{padding:1.5rem}.flex{display:flex;gap:.75rem;align-items:center}.grid{display:grid;gap:1rem}
-  table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:.75rem 1rem;border-bottom:1px solid var(--border)}
-  .badge-notif{display:inline-block;background:#ef4444;color:#fff;border-radius:999px;font-size:11px;padding:1px 6px;margin-left:4px}
-  mark{background:var(--accent-500);color:#fff;padding:0 2px;border-radius:2px}
+  .btn-ghost:hover{background:var(--panel2);filter:none;box-shadow:none}
+  .btn-sm{padding:.4rem .8rem;font-size:.85rem}
+  .muted{color:var(--fg-muted)}
+  .text-sm{font-size:.875rem}
+  .text-xs{font-size:.75rem}
+  .grid{display:grid;gap:1rem}
+  .flex{display:flex;gap:.75rem;align-items:center}
+  .flex-wrap{flex-wrap:wrap}
+  .flex-col{flex-direction:column}
+  .space-y>*+*{margin-top:1rem}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:.85rem 1rem;border-bottom:1px solid var(--border)}
+  th{font-size:.78rem;text-transform:uppercase;letter-spacing:.05em;color:var(--fg-muted);font-weight:600}
+  tr:hover{background:var(--panel2)}
+  .row-hover{transition:background .15s}
+  code{background:var(--bg2);padding:1px 6px;border-radius:4px;color:var(--accent-400);font-size:.9em;font-family:ui-monospace,monospace}
+  mark{background:var(--accent-500);color:#fff;padding:1px 4px;border-radius:3px}
+  .flash{padding:.85rem 1.1rem;border-radius:.75rem;margin-bottom:1rem;display:flex;align-items:center;gap:.6rem;animation:slideDown .3s ease;font-size:.9rem}
+  .flash-ok{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.35);color:#34d399}
+  .flash-err{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#fca5a5}
+  .flash-info{background:rgba(99,102,241,.12);border:1px solid rgba(99,102,241,.35);color:#a5b4fc}
+  .hero{padding:3rem 1rem;text-align:center;position:relative;animation:fadeIn .4s ease}
+  .hero h1{font-size:2.5rem;margin:0 0 .75rem;font-weight:800;letter-spacing:-.03em;background:linear-gradient(135deg,var(--fg),var(--accent-400));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .hero p{color:var(--fg-muted);font-size:1.05rem;margin:0;max-width:600px;margin:0 auto}
+  .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-bottom:1.5rem}
+  .stat-card{text-align:center;padding:1.25rem;background:var(--panel);border:1px solid var(--border);border-radius:.85rem;transition:transform .2s,border-color .2s}
+  .stat-card:hover{transform:translateY(-2px);border-color:var(--accent-500)}
+  .stat-card .num{font-size:1.75rem;font-weight:800;color:var(--accent-400);line-height:1;letter-spacing:-.02em}
+  .stat-card .label{font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--fg-muted);margin-top:.35rem;font-weight:600}
+  .category-card{display:flex;gap:1rem;align-items:center;padding:1.1rem 1.25rem;background:var(--panel);border:1px solid var(--border);border-radius:.85rem;transition:transform .2s,border-color .2s,background .2s;animation:fadeIn .3s ease}
+  .category-card:hover{transform:translateX(4px);border-color:var(--accent-500);background:var(--panel2)}
+  .category-card .icon{font-size:2rem;width:52px;height:52px;display:flex;align-items:center;justify-content:center;background:var(--panel2);border-radius:.75rem;border:1px solid var(--border);flex-shrink:0}
+  .category-card .info{flex:1;min-width:0}
+  .category-card .info h3{margin:0 0 .25rem;font-size:1.05rem;color:var(--fg)}
+  .category-card .info p{margin:0;color:var(--fg-muted);font-size:.85rem}
+  .category-card .count{text-align:center;color:var(--fg-muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;min-width:60px}
+  .category-card .count strong{display:block;color:var(--accent-400);font-size:1.4rem;font-weight:800}
+  .topic-row{display:flex;gap:.85rem;align-items:flex-start;padding:1rem 1.15rem;border-bottom:1px solid var(--border);transition:background .15s}
+  .topic-row:hover{background:var(--panel2)}
+  .topic-row .avatar{flex-shrink:0}
+  .topic-row .info{flex:1;min-width:0}
+  .topic-row .info .title{font-weight:600;color:var(--fg);font-size:1rem;display:inline-flex;align-items:center;gap:.4rem}
+  .topic-row .info .meta{color:var(--fg-muted);font-size:.82rem;margin-top:.25rem;display:flex;gap:.75rem;flex-wrap:wrap}
+  .topic-row .counts{display:flex;gap:1rem;text-align:center;flex-shrink:0}
+  .topic-row .counts .c{font-size:.85rem;color:var(--fg-muted)}
+  .topic-row .counts .c strong{display:block;color:var(--fg);font-weight:700}
+  .pill{display:inline-block;padding:.15rem .55rem;border-radius:999px;background:var(--panel2);border:1px solid var(--border);font-size:.72rem;color:var(--fg-muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+  .pill-accent{background:var(--glow);border-color:var(--accent-500);color:var(--accent-400)}
+  .post-card{padding:1.25rem 1.5rem;background:var(--panel);border:1px solid var(--border);border-radius:.85rem;margin-bottom:.85rem;transition:border-color .2s;animation:fadeIn .3s ease}
+  .post-card:hover{border-color:color-mix(in srgb,var(--accent-500) 30%,var(--border))}
+  .post-card .head{display:flex;gap:.75rem;align-items:center;margin-bottom:.85rem;font-size:.85rem}
+  .post-card .head .author{font-weight:600;color:var(--fg)}
+  .post-card .head .time{color:var(--fg-muted)}
+  .post-card .body{color:var(--fg);line-height:1.65;word-wrap:break-word;overflow-wrap:break-word}
+  .post-card .body blockquote{margin:.5rem 0}
+  .post-card .reactions{display:flex;gap:.4rem;margin-top:.75rem;flex-wrap:wrap}
+  .react-btn{background:transparent;border:1px solid var(--border);border-radius:.55rem;padding:.3rem .6rem;cursor:pointer;color:var(--fg);font-size:.85rem;transition:all .15s;display:inline-flex;align-items:center;gap:.25rem}
+  .react-btn:hover{background:var(--panel2);border-color:var(--accent-500);transform:scale(1.05)}
+  .react-btn.active{background:var(--glow);border-color:var(--accent-500);color:var(--accent-400)}
+  .breadcrumb{display:flex;gap:.5rem;align-items:center;font-size:.85rem;color:var(--fg-muted);margin-bottom:1rem;flex-wrap:wrap}
+  .breadcrumb a{color:var(--accent-400)}
+  .avatar-lg{width:96px;height:96px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:2.5rem;font-weight:800;color:#fff;box-shadow:0 12px 24px var(--glow)}
+  .footer{padding:3rem 1.25rem 2rem;text-align:center;color:var(--fg-muted);font-size:.85rem;border-top:1px solid var(--border);margin-top:3rem}
+  .footer a{color:var(--accent-400)}
+  .online-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 8px #10b981;margin-right:.4rem;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  @media (max-width:640px){
+    .hero h1{font-size:1.8rem}
+    .container{padding:1.25rem 1rem}
+    .topic-row .counts{display:none}
+    .card{padding:1.25rem}
+    nav.actions{gap:.25rem}
+    nav.actions a,nav.actions button{font-size:.82rem;padding:.35rem .6rem}
+    .stat-grid{grid-template-columns:repeat(2,1fr)}
+  }
 </style>
 </head>
 <body>
 <header class="nav"><div class="inner">
-  <a class="logo" href="/"><span class="mark">L</span><span>LiteForum</span></a>
-  <nav class="flex" style="flex-wrap:wrap">
-    <form action="/search.php" method="get" style="margin:0" class="flex">
-      <input name="q" placeholder="<?= e(t('search_placeholder')) ?>" style="width:180px;padding:.35rem .5rem;font-size:13px">
+  <a class="logo" href="/"><span class="mark"><?= e(mb_substr($appName,0,1)) ?></span><span><?= e($appName) ?></span></a>
+  <nav class="actions">
+    <a href="/activity.php" title="<?= e(t('activity')) ?>">📊</a>
+    <a href="/stats.php" title="<?= e(t('stats')) ?>">📈</a>
+    <form action="/search.php" method="get" style="margin:0">
+      <input name="q" placeholder="<?= e(t('search_placeholder')) ?>" style="width:150px;padding:.4rem .65rem;font-size:.85rem">
     </form>
-    <form method="post" action="/lang.php" style="margin:0" class="flex">
+    <form method="post" action="/lang.php" style="margin:0">
       <?= csrf_field() ?>
-      <select name="lang" onchange="this.form.submit()" style="width:auto;padding:.35rem .5rem;font-size:12px">
+      <select name="lang" onchange="this.form.submit()" style="width:auto;padding:.35rem .55rem;font-size:.8rem">
         <?php foreach (($GLOBALS['__config']['available_langs'] ?? ['tr','en']) as $lc): ?>
           <option value="<?= e($lc) ?>" <?= ($_SESSION['ui_lang']??'')===$lc?'selected':'' ?>><?= e(strtoupper($lc)) ?></option>
         <?php endforeach; ?>
       </select>
     </form>
     <?php if ($u): ?>
-      <a href="/notifications.php" style="position:relative">🔔<?php $n=notif_unread_count($GLOBALS['db'],(int)$u['id']); if ($n>0): ?><span class="badge-notif"><?= $n ?></span><?php endif; ?></a>
-      <a href="/settings.php">⚙</a>
-      <span class="muted">@<?= e($u['username']) ?></span>
-      <?php if ($u['role']==='admin'): ?><a href="/admin.php">Admin</a><?php endif; ?>
-      <form method="post" action="/logout.php" style="margin:0"><?= csrf_field() ?><button class="btn-ghost" type="submit"><?= e(t('logout')) ?></button></form>
+      <a href="/notifications.php" class="icon-link" title="<?= e(t('notifications')) ?>">🔔<?php if ($unread>0): ?><span class="badge-notif"><?= $unread ?></span><?php endif; ?></a>
+      <a href="/user.php?u=<?= e($u['username']) ?>" class="flex" style="gap:.4rem">
+        <?= user_avatar($u['username'], $u['avatar_color'] ?? '#6366f1', 28) ?>
+        <span style="font-size:.88rem;font-weight:600">@<?= e($u['username']) ?></span>
+      </a>
+      <?php if ($u['role']==='admin'): ?><a href="/admin.php" class="icon-link" title="Admin">⚙</a><?php endif; ?>
+      <form method="post" action="/logout.php" style="margin:0"><?= csrf_field() ?><button class="btn-ghost btn-sm" type="submit"><?= e(t('logout')) ?></button></form>
     <?php else: ?>
       <a href="/login.php"><?= e(t('login')) ?></a>
-      <a href="/register.php"><?= e(t('register')) ?></a>
+      <a href="/register.php" class="btn btn-sm" style="color:#fff"><?= e(t('register')) ?></a>
     <?php endif; ?>
   </nav>
 </div></header>
-<main class="container"><?= $content ?></main>
+<main class="container">
+<?php if ($flash): ?>
+  <div class="flash flash-<?= e($flash['type']) ?>">
+    <span><?= $flash['type']==='ok' ? '✅' : ($flash['type']==='err' ? '❌' : 'ℹ️') ?></span>
+    <span><?= e($flash['msg']) ?></span>
+  </div>
+<?php endif; ?>
+<?= $content ?>
+</main>
+<footer class="footer">
+  <p><strong><?= e($appName) ?></strong> <?= e($appTagline) ?></p>
+  <p style="margin-top:.5rem"><span class="online-dot"></span><?= $online ?> <?= e(t('online_users')) ?></p>
+</footer>
 </body></html>
 PHP
 
   cat > "$APP_DIR/views/home.php" <<'PHP'
-<?php /* @var array $cats */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
-<div class="glass card">
-  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e(t('forum')) ?></h1>
-  <table><thead><tr><th><?= e(t('categories')) ?></th><th><?= e(t('topics')) ?></th></tr></thead><tbody>
-    <?php foreach ($cats as $c): ?>
-      <tr><td><a href="/category.php?slug=<?= e($c['slug']) ?>"><?= e($c['name_'.$lc] ?? $c['name_en']) ?></a></td>
-          <td class="muted"><?= (int)$c['n'] ?></td></tr>
-    <?php endforeach; ?>
-  </tbody></table>
+<?php /* @var array $cats @var array $recent @var array $stats */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
+<div class="hero">
+  <h1><?= e($GLOBALS['__app_name']) ?></h1>
+  <p><?= e($GLOBALS['__app_tagline']) ?></p>
+</div>
+
+<div class="stat-grid">
+  <div class="stat-card"><div class="num"><?= (int)$stats['topics'] ?></div><div class="label"><?= e(t('total_topics')) ?></div></div>
+  <div class="stat-card"><div class="num"><?= (int)$stats['posts'] ?></div><div class="label"><?= e(t('total_posts')) ?></div></div>
+  <div class="stat-card"><div class="num"><?= (int)$stats['users'] ?></div><div class="label"><?= e(t('total_users')) ?></div></div>
+  <div class="stat-card"><div class="num"><?= (int)$stats['online'] ?></div><div class="label"><?= e(t('online_users')) ?></div></div>
+</div>
+
+<h2 style="margin:1.5rem 0 1rem;font-size:1.25rem;letter-spacing:-.01em"><?= e(t('categories')) ?></h2>
+<div class="grid" style="margin-bottom:2rem">
+  <?php foreach ($cats as $c): ?>
+    <a href="/category.php?slug=<?= e($c['slug']) ?>" class="category-card">
+      <span class="icon"><?= e($c['icon'] ?? '💬') ?></span>
+      <div class="info">
+        <h3><?= e(cat_name($c, $lc)) ?></h3>
+        <?php $desc = cat_desc($c, $lc); if ($desc): ?><p><?= e($desc) ?></p><?php endif; ?>
+      </div>
+      <div class="count">
+        <strong><?= (int)$c['n'] ?></strong>
+        <?= e(t('topics')) ?>
+      </div>
+    </a>
+  <?php endforeach; ?>
+</div>
+
+<h2 style="margin:1.5rem 0 1rem;font-size:1.25rem;letter-spacing:-.01em"><?= e(t('recent_topics')) ?></h2>
+<div class="glass">
+  <?php if (empty($recent)): ?>
+    <div class="card muted" style="text-align:center"><?= e(t('no_topics_yet')) ?></div>
+  <?php else: foreach ($recent as $r): ?>
+    <a href="/topic.php?id=<?= (int)$r['id'] ?>" class="topic-row" style="text-decoration:none;color:inherit">
+      <?= user_avatar($r['username'], '#6366f1', 36) ?>
+      <div class="info">
+        <div class="title"><?php if ((int)$r['is_pinned']): ?><span class="pill pill-accent">📌</span><?php endif; ?> <?= e($r['title']) ?></div>
+        <div class="meta">
+          <span>@<?= e($r['username']) ?></span>
+          <span>· <?= e($r['cat_slug']) ?></span>
+          <span>· <?= time_ago((int)$r['updated_at']) ?></span>
+        </div>
+      </div>
+      <div class="counts">
+        <div class="c"><strong><?= (int)$r['post_count'] ?></strong><?= e(t('posts')) ?></div>
+      </div>
+    </a>
+  <?php endforeach; endif; ?>
 </div>
 PHP
 
   cat > "$APP_DIR/views/category.php" <<'PHP'
-<?php /* @var array $cat @var array $topics */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
-<div class="glass card">
-  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e($cat['name_'.$lc] ?? $cat['name_en']) ?></h1>
-  <p><a href="/new-topic.php?cat=<?= (int)$cat['id'] ?>">+ <?= e(t('new_topic')) ?></a></p>
-  <?php if (empty($topics)): ?>
-    <p class="muted">Henüz konu yok.</p>
-  <?php else: ?>
-    <table><thead><tr><th>Konu</th><th>Yazar</th><th>Mesaj</th><th>Tarih</th></tr></thead><tbody>
-      <?php foreach ($topics as $t): ?>
-        <tr>
-          <td><?php if ((int)$t['is_pinned']): ?>📌 <?php endif; ?><a href="/topic.php?id=<?= (int)$t['id'] ?>"><?= e($t['title']) ?></a></td>
-          <td class="muted">@<?= e($t['username']) ?></td>
-          <td class="muted"><?= (int)$t['post_count'] ?></td>
-          <td class="muted"><?= date('Y-m-d', (int)$t['updated_at']) ?></td>
-        </tr>
-      <?php endforeach; ?>
-    </tbody></table>
+<?php /* @var array $cat @var array $topics @var int $page @var int $total */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
+<div class="breadcrumb">
+  <a href="/"><?= e(t('home')) ?></a> <span>›</span> <span><?= e(cat_name($cat, $lc)) ?></span>
+</div>
+<div class="flex" style="justify-content:space-between;margin-bottom:1.25rem;flex-wrap:wrap">
+  <h1 style="margin:0;font-size:1.75rem;letter-spacing:-.02em"><?= e($cat['icon']) ?> <?= e(cat_name($cat, $lc)) ?></h1>
+  <?php if (auth_user()): ?>
+    <a href="/new-topic.php?cat=<?= (int)$cat['id'] ?>" class="btn">+ <?= e(t('new_topic')) ?></a>
   <?php endif; ?>
 </div>
+<?php $desc = cat_desc($cat, $lc); if ($desc): ?>
+  <p class="muted" style="margin:-.5rem 0 1.25rem"><?= e($desc) ?></p>
+<?php endif; ?>
+
+<div class="glass">
+  <?php if (empty($topics)): ?>
+    <div class="card muted" style="text-align:center"><?= e(t('no_topics_yet')) ?></div>
+  <?php else: foreach ($topics as $t): ?>
+    <a href="/topic.php?id=<?= (int)$t['id'] ?>" class="topic-row" style="text-decoration:none;color:inherit">
+      <?= user_avatar($t['username'], $t['avatar_color'] ?? '#6366f1', 36) ?>
+      <div class="info">
+        <div class="title">
+          <?php if ((int)$t['is_pinned']): ?><span class="pill pill-accent">📌</span><?php endif; ?>
+          <?php if ((int)$t['is_locked']): ?><span class="pill">🔒</span><?php endif; ?>
+          <?= e($t['title']) ?>
+        </div>
+        <div class="meta">
+          <span>@<?= e($t['username']) ?></span>
+          <span>· <?= time_ago((int)$t['updated_at']) ?></span>
+          <span>· <?= (int)$t['views'] ?> <?= e(t('views')) ?></span>
+        </div>
+      </div>
+      <div class="counts">
+        <div class="c"><strong><?= (int)$t['post_count'] ?></strong><?= e(t('posts')) ?></div>
+      </div>
+    </a>
+  <?php endforeach; endif; ?>
+</div>
+<?php if (($total ?? 0) > 25): ?>
+  <div class="flex" style="justify-content:center;margin-top:1.5rem;gap:.5rem">
+    <?php $totalPages = (int)ceil($total / 25);
+    for ($i=1; $i<=$totalPages; $i++): ?>
+      <a href="?slug=<?= e($cat['slug']) ?>&page=<?= $i ?>" class="<?= $i===$page?'btn':'btn-ghost btn' ?>" style="padding:.4rem .8rem;font-size:.85rem"><?= $i ?></a>
+    <?php endfor; ?>
+  </div>
+<?php endif; ?>
 PHP
 
   cat > "$APP_DIR/views/topic.php" <<'PHP'
-<?php /* @var array $topic @var array $posts @var bool $watching */ ?>
-<div class="glass card" style="margin-bottom:1rem">
-  <h1 style="margin:0 0 .5rem;color:var(--fg)"><?= e($topic['title']) ?></h1>
-  <p class="muted" style="margin:0;font-size:13px">@<?= e($topic['username']) ?> · <?= date('Y-m-d H:i', (int)$topic['created_at']) ?></p>
+<?php /* @var array $topic @var array $posts @var bool $watching @var array $reactions */ ?>
+<div class="breadcrumb">
+  <a href="/"><?= e(t('home')) ?></a> <span>›</span>
+  <a href="/category.php?slug=<?= e($topic['cat_slug']) ?>"><?= e($topic['cat_name']) ?></a> <span>›</span>
+  <span><?= e(mb_substr($topic['title'], 0, 50)) ?><?= mb_strlen($topic['title']) > 50 ? '…' : '' ?></span>
+</div>
+<div class="glass card" style="margin-bottom:1.25rem">
+  <h1 style="margin:0 0 .5rem;font-size:1.5rem;letter-spacing:-.02em"><?= e($topic['title']) ?></h1>
+  <div class="flex muted" style="font-size:.85rem;flex-wrap:wrap">
+    <?= user_avatar($topic['username'], '#6366f1', 24) ?>
+    <span>@<?= e($topic['username']) ?></span>
+    <span>· <?= date('Y-m-d H:i', (int)$topic['created_at']) ?></span>
+    <span>· <?= (int)$topic['views'] ?> <?= e(t('views')) ?></span>
+  </div>
   <?php if (auth_user()): ?>
-    <form method="post" action="/topic.php?id=<?= (int)$topic['id'] ?>" style="margin-top:.75rem">
+    <form method="post" action="/topic.php?id=<?= (int)$topic['id'] ?>" style="margin-top:.85rem">
       <?= csrf_field() ?><input type="hidden" name="action" value="toggle_watch">
-      <button class="btn-ghost" type="submit"><?= e($watching ? t('unwatch_topic') : t('watch_topic')) ?></button>
+      <button class="btn-ghost btn" type="submit"><?= $watching ? '👁 ' : '🔔 ' ?><?= e($watching ? t('unwatch_topic') : t('watch_topic')) ?></button>
     </form>
   <?php endif; ?>
 </div>
-<?php foreach ($posts as $p): ?>
-  <div class="glass card" style="margin-bottom:.75rem">
-    <p class="muted" style="margin:0 0 .5rem;font-size:12px">@<?= e($p['username']) ?> · <?= date('Y-m-d H:i', (int)$p['created_at']) ?></p>
-    <div style="white-space:pre-wrap"><?= e($p['body']) ?></div>
+
+<?php foreach ($posts as $p):
+  $pid = (int)$p['id'];
+  $postReacts = $reactions[$pid] ?? [];
+  $myReacts = $myReacted[$pid] ?? [];
+?>
+  <div class="post-card">
+    <div class="head">
+      <?= user_avatar($p['username'], $p['avatar_color'] ?? '#6366f1', 28) ?>
+      <span class="author">@<?= e($p['username']) ?></span>
+      <span class="time">· <?= time_ago((int)$p['created_at']) ?></span>
+    </div>
+    <div class="body"><?= render_post($p['body']) ?></div>
+    <?php if (auth_user()): ?>
+      <div class="reactions">
+        <?php foreach (['👍','❤️','🔥','😂','😮'] as $emoji):
+          $cnt = $postReacts[$emoji] ?? 0;
+          $active = in_array($emoji, $myReacts);
+        ?>
+          <form method="post" action="/react.php" style="margin:0;display:inline">
+            <?= csrf_field() ?>
+            <input type="hidden" name="post_id" value="<?= $pid ?>">
+            <input type="hidden" name="emoji" value="<?= e($emoji) ?>">
+            <input type="hidden" name="back" value="/topic.php?id=<?= (int)$topic['id'] ?>">
+            <button class="react-btn <?= $active?'active':'' ?>" type="submit"><?= e($emoji) ?><?php if ($cnt>0): ?> <?= $cnt ?><?php endif; ?></button>
+          </form>
+        <?php endforeach; ?>
+      </div>
+    <?php elseif (!empty($postReacts)): ?>
+      <div class="reactions">
+        <?php foreach ($postReacts as $emoji => $cnt): if ($cnt>0): ?>
+          <span class="react-btn"><?= e($emoji) ?> <?= (int)$cnt ?></span>
+        <?php endif; endforeach; ?>
+      </div>
+    <?php endif; ?>
   </div>
 <?php endforeach; ?>
+
 <?php if (auth_user() && empty($topic['is_locked'])): ?>
-<div class="glass card">
-  <h2 style="margin:0 0 .75rem;color:var(--fg)"><?= e(t('reply')) ?></h2>
+<div class="glass card" style="margin-top:1.5rem">
+  <h2 style="margin:0 0 1rem;font-size:1.15rem"><?= e(t('reply')) ?></h2>
   <form method="post" action="/topic.php?id=<?= (int)$topic['id'] ?>" class="grid">
     <?= csrf_field() ?><input type="hidden" name="action" value="reply">
-    <textarea name="body" rows="5" required></textarea>
+    <textarea name="body" rows="6" required placeholder="**bold** *italic* `code` [link](url) @user &gt; quote"></textarea>
     <button type="submit"><?= e(t('submit')) ?></button>
   </form>
 </div>
@@ -613,14 +1112,19 @@ PHP
 PHP
 
   cat > "$APP_DIR/views/new-topic.php" <<'PHP'
-<?php /* @var array $cat @var string $error */ ?>
-<div class="glass card" style="max-width:640px;margin:2rem auto">
-  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e(t('new_topic')) ?> — <?= e($cat['name_'.($_SESSION['ui_lang']??'tr')] ?? $cat['name_en']) ?></h1>
-  <?php if (!empty($error)): ?><p style="color:#fca5a5"><?= e($error) ?></p><?php endif; ?>
+<?php /* @var array $cat @var string $error */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
+<div class="breadcrumb">
+  <a href="/"><?= e(t('home')) ?></a> <span>›</span>
+  <a href="/category.php?slug=<?= e($cat['slug']) ?>"><?= e(cat_name($cat, $lc)) ?></a> <span>›</span>
+  <span><?= e(t('new_topic')) ?></span>
+</div>
+<div class="glass card" style="max-width:720px;margin:0 auto">
+  <h1 style="margin:0 0 1.25rem;font-size:1.5rem"><?= e(t('new_topic')) ?></h1>
+  <?php if (!empty($error)): ?><div class="flash flash-err"><?= e($error) ?></div><?php endif; ?>
   <form method="post" class="grid">
     <?= csrf_field() ?>
-    <input name="title" required minlength="3" maxlength="200" placeholder="Başlık">
-    <textarea name="body" rows="8" required placeholder="İçerik"></textarea>
+    <input name="title" required minlength="3" maxlength="200" placeholder="<?= e(t('title')) ?>">
+    <textarea name="body" rows="10" required placeholder="<?= e(t('body')) ?>"></textarea>
     <button type="submit"><?= e(t('submit')) ?></button>
   </form>
 </div>
@@ -628,9 +1132,9 @@ PHP
 
   cat > "$APP_DIR/views/login.php" <<'PHP'
 <?php /* @var string $error */ $config = $GLOBALS['__config']; ?>
-<div class="glass card" style="max-width:420px;margin:2rem auto">
-  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e(t('login')) ?></h1>
-  <?php if (!empty($error)): ?><p style="color:#fca5a5"><?= e($error) ?></p><?php endif; ?>
+<div class="glass card" style="max-width:440px;margin:2rem auto;animation:fadeIn .3s ease">
+  <h1 style="margin:0 0 1.25rem;font-size:1.5rem"><?= e(t('login')) ?></h1>
+  <?php if (!empty($error)): ?><div class="flash flash-err"><?= e($error) ?></div><?php endif; ?>
   <form method="post" class="grid">
     <?= csrf_field() ?>
     <input name="email" type="email" required placeholder="<?= e(t('email')) ?>" autocomplete="username">
@@ -648,75 +1152,94 @@ PHP
          . '&scope='        . rawurlencode($config['erendev']['scope'])
          . '&state='        . rawurlencode($state);
   ?>
-  <div style="margin-top:1.25rem;padding-top:1.25rem;border-top:1px solid var(--border)">
-    <a href="<?= e($url) ?>"><img src="<?= e($config['erendev']['button_svg']) ?>" alt="ErenDev ile Giriş Yap" width="240" height="48" style="height:48px"></a>
+  <div style="margin-top:1.5rem;padding-top:1.5rem;border-top:1px solid var(--border);text-align:center">
+    <a href="<?= e($url) ?>"><img src="<?= e($config['erendev']['button_svg']) ?>" alt="ErenDev ile Giriş Yap" width="240" height="48" style="height:48px;transition:transform .15s" onmouseover="this.style.transform='scale(1.03)'" onmouseout="this.style.transform='scale(1)'"></a>
   </div>
   <?php endif; ?>
+  <p class="muted text-sm" style="margin-top:1.25rem;text-align:center">
+    <?= e(t('register')) ?>? <a href="/register.php"><?= e(t('register')) ?></a>
+  </p>
 </div>
 PHP
 
   cat > "$APP_DIR/views/register.php" <<'PHP'
 <?php /* @var string $error */ $config = $GLOBALS['__config']; ?>
-<div class="glass card" style="max-width:420px;margin:2rem auto">
-  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e(t('register')) ?></h1>
-  <?php if (!empty($error)): ?><p style="color:#fca5a5"><?= e($error) ?></p><?php endif; ?>
+<div class="glass card" style="max-width:440px;margin:2rem auto;animation:fadeIn .3s ease">
+  <h1 style="margin:0 0 1.25rem;font-size:1.5rem"><?= e(t('register')) ?></h1>
+  <?php if (!empty($error)): ?><div class="flash flash-err"><?= e($error) ?></div><?php endif; ?>
   <form method="post" class="grid">
     <?= csrf_field() ?>
     <input name="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_\-]{3,32}" placeholder="<?= e(t('username')) ?>">
     <input name="email" type="email" required placeholder="<?= e(t('email')) ?>">
-    <input name="password" type="password" required minlength="10" placeholder="<?= e(t('password')) ?>">
+    <input name="password" type="password" required minlength="10" placeholder="<?= e(t('password')) ?> (min 10)">
     <input name="hp" type="text" tabindex="-1" style="display:none">
     <button type="submit"><?= e(t('register')) ?></button>
   </form>
   <?php $showErenDev = (($config['default_lang'] ?? '') === 'tr') && (($_SESSION['ui_lang'] ?? '') === 'tr');
   if ($showErenDev): ?>
-    <div style="margin-top:1.25rem;padding-top:1.25rem;border-top:1px solid var(--border)">
+    <div style="margin-top:1.5rem;padding-top:1.5rem;border-top:1px solid var(--border);text-align:center">
       <a href="/login.php"><img src="<?= e($config['erendev']['button_svg']) ?>" alt="ErenDev ile Giriş Yap" style="height:48px"></a>
     </div>
   <?php endif; ?>
+  <p class="muted text-sm" style="margin-top:1.25rem;text-align:center">
+    <?= e(t('login')) ?>? <a href="/login.php"><?= e(t('login')) ?></a>
+  </p>
 </div>
 PHP
 
   cat > "$APP_DIR/views/search.php" <<'PHP'
-<?php /* @var string $q @var array $result @var array $cats */ ?>
-<div class="glass card">
-  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e(t('search_results')) ?>: "<?= e($q) ?>"</h1>
-  <form method="get" action="/search.php" class="flex" style="margin-bottom:1rem;flex-wrap:wrap">
-    <input name="q" value="<?= e($q) ?>" style="flex:1;min-width:200px">
-    <select name="cat" style="width:auto">
+<?php /* @var string $q @var array $result @var array $cats */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
+<div class="glass card" style="margin-bottom:1rem">
+  <h1 style="margin:0 0 1rem;font-size:1.5rem"><?= e(t('search')) ?></h1>
+  <form method="get" action="/search.php" class="flex flex-wrap" style="gap:.5rem">
+    <input name="q" value="<?= e($q) ?>" placeholder="<?= e(t('search_placeholder')) ?>" style="flex:1;min-width:200px">
+    <select name="cat" style="width:auto;max-width:180px">
       <option value="">— <?= e(t('categories')) ?> —</option>
       <?php foreach ($cats as $c): ?>
-        <option value="<?= (int)$c['id'] ?>" <?= (($_GET['cat']??'')==$c['id'])?'selected':'' ?>><?= e($c['name_tr']) ?></option>
+        <option value="<?= (int)$c['id'] ?>" <?= (($_GET['cat']??'')==$c['id'])?'selected':'' ?>><?= e(cat_name($c, $lc)) ?></option>
       <?php endforeach; ?>
     </select>
     <input name="author" placeholder="author" value="<?= e($_GET['author']??'') ?>" style="width:120px">
     <button type="submit"><?= e(t('search')) ?></button>
   </form>
-  <?php if (empty($result['rows'])): ?>
-    <p class="muted"><?= e(t('no_results')) ?></p>
-  <?php else: foreach ($result['rows'] as $r): ?>
-    <div style="padding:1rem 0;border-bottom:1px solid var(--border)">
-      <a href="/topic.php?id=<?= (int)$r['topic_id'] ?>" style="font-weight:600"><?= e($r['topic_title']) ?></a>
-      <span class="muted" style="font-size:12px"> · @<?= e($r['username']) ?></span>
-      <p style="margin:.5rem 0 0"><?= $r['snippet'] ?></p>
-    </div>
-  <?php endforeach; endif; ?>
 </div>
+<?php if ($q !== ''): ?>
+<div class="glass">
+  <?php if (empty($result['rows'])): ?>
+    <div class="card muted" style="text-align:center"><?= e(t('no_results')) ?></div>
+  <?php else: ?>
+    <div class="card" style="padding-bottom:0"><strong><?= (int)$result['total'] ?> results</strong></div>
+    <?php foreach ($result['rows'] as $r): ?>
+      <div class="topic-row" style="display:block">
+        <a href="/topic.php?id=<?= (int)$r['topic_id'] ?>" style="font-weight:600;font-size:1rem"><?= e($r['topic_title']) ?></a>
+        <div class="meta" style="margin-top:.35rem;color:var(--fg-muted);font-size:.82rem">@<?= e($r['username']) ?></div>
+        <p style="margin:.5rem 0 0;color:var(--fg)"><?= $r['snippet'] ?></p>
+      </div>
+    <?php endforeach; ?>
+  <?php endif; ?>
+</div>
+<?php endif; ?>
 PHP
 
   cat > "$APP_DIR/views/notifications.php" <<'PHP'
 <?php /* @var array $items */ ?>
-<div class="glass card">
-  <div class="flex" style="justify-content:space-between;margin-bottom:1rem">
-    <h1 style="margin:0;color:var(--fg)"><?= e(t('notifications')) ?></h1>
-    <form method="post" action="/notifications.php" style="margin:0"><?= csrf_field() ?><input type="hidden" name="action" value="mark_all"><button class="btn-ghost" type="submit"><?= e(t('mark_all_read')) ?></button></form>
-  </div>
-  <?php if (empty($items)): ?><p class="muted"><?= e(t('no_notifications')) ?></p>
+<div class="flex" style="justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap">
+  <h1 style="margin:0;font-size:1.5rem"><?= e(t('notifications')) ?></h1>
+  <form method="post" action="/notifications.php" style="margin:0"><?= csrf_field() ?><input type="hidden" name="action" value="mark_all"><button class="btn-ghost btn btn-sm" type="submit"><?= e(t('mark_all_read')) ?></button></form>
+</div>
+<div class="glass">
+  <?php if (empty($items)): ?><div class="card muted" style="text-align:center"><?= e(t('no_notifications')) ?></div>
   <?php else: foreach ($items as $n): ?>
-    <div style="padding:.75rem 0;border-bottom:1px solid var(--border);<?= $n['read_at']?'opacity:.6':'' ?>">
-      <strong><?= e($n['kind']) ?></strong>
-      <?php if ($n['actor']): ?><span class="muted">by @<?= e($n['actor']) ?></span><?php endif; ?>
-      <?php if ($n['topic_id']): ?><a href="/topic.php?id=<?= (int)$n['topic_id'] ?>" style="margin-left:.5rem">→</a><?php endif; ?>
+    <div class="topic-row" style="opacity:<?= $n['read_at']?'0.6':'1' ?>">
+      <div class="info">
+        <div class="title">
+          <span class="pill pill-accent"><?= e($n['kind']) ?></span>
+          <?php if ($n['actor']): ?><span class="muted">@<?= e($n['actor']) ?></span><?php endif; ?>
+        </div>
+        <?php if ($n['snippet']): ?><p class="muted" style="margin:.35rem 0 0;font-size:.85rem"><?= e($n['snippet']) ?></p><?php endif; ?>
+        <div class="meta"><span><?= time_ago((int)$n['created_at']) ?></span></div>
+      </div>
+      <?php if ($n['topic_id']): ?><a href="/topic.php?id=<?= (int)$n['topic_id'] ?>" class="btn btn-sm">→</a><?php endif; ?>
     </div>
   <?php endforeach; endif; ?>
 </div>
@@ -724,52 +1247,199 @@ PHP
 
   cat > "$APP_DIR/views/settings.php" <<'PHP'
 <?php /* @var array $user */ ?>
-<div class="glass card" style="max-width:520px;margin:2rem auto">
-  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e(t('settings')) ?></h1>
+<div class="glass card" style="max-width:560px;margin:2rem auto;animation:fadeIn .3s">
+  <h1 style="margin:0 0 1.25rem;font-size:1.5rem"><?= e(t('settings')) ?></h1>
   <form method="post" class="grid">
     <?= csrf_field() ?>
-    <label><?= e(t('theme')) ?><select name="theme">
-      <?php foreach (($GLOBALS['__config']['themes']??['dark']) as $th): ?>
-        <option value="<?= e($th) ?>" <?= ($user['theme']??'dark')===$th?'selected':'' ?>><?= e($th) ?></option>
-      <?php endforeach; ?>
-    </select></label>
-    <label><?= e(t('accent')) ?><select name="accent">
-      <?php foreach (($GLOBALS['__config']['accents']??['indigo']) as $ac): ?>
-        <option value="<?= e($ac) ?>" <?= ($user['accent']??'indigo')===$ac?'selected':'' ?>><?= e($ac) ?></option>
-      <?php endforeach; ?>
-    </select></label>
-    <label class="flex"><input type="checkbox" name="notify_mentions" style="width:auto" <?= ($user['notify_mentions']??1)?'checked':'' ?>> Mentions</label>
-    <label class="flex"><input type="checkbox" name="notify_replies" style="width:auto" <?= ($user['notify_replies']??1)?'checked':'' ?>> Replies</label>
+    <label class="text-sm">
+      <span class="muted" style="display:block;margin-bottom:.35rem"><?= e(t('bio')) ?></span>
+      <textarea name="bio" rows="3" maxlength="500" placeholder="..."><?= e($user['bio'] ?? '') ?></textarea>
+    </label>
+    <label class="text-sm">
+      <span class="muted" style="display:block;margin-bottom:.35rem"><?= e(t('theme')) ?></span>
+      <select name="theme">
+        <?php foreach (($GLOBALS['__config']['themes']??['dark']) as $th): ?>
+          <option value="<?= e($th) ?>" <?= ($user['theme']??'dark')===$th?'selected':'' ?>><?= e($th) ?></option>
+        <?php endforeach; ?>
+      </select>
+    </label>
+    <label class="text-sm">
+      <span class="muted" style="display:block;margin-bottom:.35rem"><?= e(t('accent')) ?></span>
+      <select name="accent">
+        <?php foreach (($GLOBALS['__config']['accents']??['indigo']) as $ac): ?>
+          <option value="<?= e($ac) ?>" <?= ($user['accent']??'indigo')===$ac?'selected':'' ?>><?= e($ac) ?></option>
+        <?php endforeach; ?>
+      </select>
+    </label>
+    <label class="text-sm">
+      <span class="muted" style="display:block;margin-bottom:.35rem">Avatar color</span>
+      <input type="color" name="avatar_color" value="<?= e($user['avatar_color'] ?? '#6366f1') ?>" style="height:44px;padding:4px">
+    </label>
+    <label class="flex"><input type="checkbox" name="notify_mentions" style="width:auto" <?= ($user['notify_mentions']??1)?'checked':'' ?>> <span>Mentions</span></label>
+    <label class="flex"><input type="checkbox" name="notify_replies" style="width:auto" <?= ($user['notify_replies']??1)?'checked':'' ?>> <span>Replies</span></label>
+    <label class="flex"><input type="checkbox" name="notify_digest" style="width:auto" <?= ($user['notify_digest']??0)?'checked':'' ?>> <span>Digest</span></label>
     <button type="submit"><?= e(t('save')) ?></button>
   </form>
 </div>
 PHP
 
-  cat > "$APP_DIR/views/admin.php" <<'PHP'
-<?php /* @var array $users @var array $cats @var array $audit */ ?>
+  cat > "$APP_DIR/views/user.php" <<'PHP'
+<?php /* @var array $profile @var array $topics @var array $posts */ ?>
+<div class="glass card" style="margin-bottom:1.25rem;display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap">
+  <div class="avatar-lg" style="background:linear-gradient(135deg,<?= e($profile['avatar_color']) ?>,<?= e($profile['avatar_color']) ?>99)"><?= e(mb_strtoupper(mb_substr($profile['username'],0,1))) ?></div>
+  <div style="flex:1;min-width:200px">
+    <h1 style="margin:0 0 .35rem;font-size:1.75rem">@<?= e($profile['username']) ?></h1>
+    <?php if ($profile['bio']): ?><p class="muted" style="margin:0 0 .5rem"><?= e($profile['bio']) ?></p><?php endif; ?>
+    <div class="flex flex-wrap muted" style="font-size:.85rem;gap:1rem">
+      <span><span class="pill"><?= e($profile['role']) ?></span></span>
+      <span><?= e(t('joined')) ?>: <?= date('Y-m-d', (int)$profile['created_at']) ?></span>
+      <span><?= e(t('last_seen')) ?>: <?= time_ago((int)($profile['last_seen_at'] ?? $profile['created_at'])) ?></span>
+    </div>
+  </div>
+</div>
+
+<h2 style="margin:1.5rem 0 1rem;font-size:1.15rem"><?= e(t('topics')) ?> (<?= count($topics) ?>)</h2>
+<div class="glass">
+  <?php if (empty($topics)): ?><div class="card muted" style="text-align:center">—</div>
+  <?php else: foreach ($topics as $t): ?>
+    <a href="/topic.php?id=<?= (int)$t['id'] ?>" class="topic-row" style="text-decoration:none;color:inherit;display:block">
+      <div class="title"><?= e($t['title']) ?></div>
+      <div class="meta"><span><?= e($t['cat_name']) ?></span><span>· <?= time_ago((int)$t['updated_at']) ?></span></div>
+    </a>
+  <?php endforeach; endif; ?>
+</div>
+
+<h2 style="margin:1.5rem 0 1rem;font-size:1.15rem"><?= e(t('posts')) ?> (<?= count($posts) ?>)</h2>
+<div class="glass">
+  <?php if (empty($posts)): ?><div class="card muted" style="text-align:center">—</div>
+  <?php else: foreach ($posts as $p): ?>
+    <a href="/topic.php?id=<?= (int)$p['topic_id'] ?>" class="topic-row" style="text-decoration:none;color:inherit;display:block">
+      <div class="title"><?= e($p['topic_title']) ?></div>
+      <div class="meta"><span><?= time_ago((int)$p['created_at']) ?></span></div>
+      <p style="margin:.5rem 0 0;color:var(--fg-muted);font-size:.9rem"><?= e(mb_substr($p['body'], 0, 140)) ?><?= mb_strlen($p['body']) > 140 ? '…' : '' ?></p>
+    </a>
+  <?php endforeach; endif; ?>
+</div>
+PHP
+
+  cat > "$APP_DIR/views/stats.php" <<'PHP'
+<?php /* @var array $stats @var array $topUsers */ ?>
+<div class="hero" style="padding:1.5rem 1rem">
+  <h1 style="font-size:2rem"><?= e(t('stats')) ?></h1>
+</div>
+<div class="stat-grid">
+  <div class="stat-card"><div class="num"><?= (int)$stats['topics'] ?></div><div class="label"><?= e(t('total_topics')) ?></div></div>
+  <div class="stat-card"><div class="num"><?= (int)$stats['posts'] ?></div><div class="label"><?= e(t('total_posts')) ?></div></div>
+  <div class="stat-card"><div class="num"><?= (int)$stats['users'] ?></div><div class="label"><?= e(t('total_users')) ?></div></div>
+  <div class="stat-card"><div class="num"><?= (int)$stats['online'] ?></div><div class="label"><?= e(t('online_users')) ?></div></div>
+</div>
+<?php if ($stats['newest']): ?>
 <div class="glass card" style="margin-bottom:1rem">
-  <h1 style="margin:0 0 1rem;color:var(--fg)">Admin — Users</h1>
-  <form method="post" action="/admin.php" class="flex" style="margin-bottom:1rem">
-    <?= csrf_field() ?><input type="hidden" name="action" value="bulk_role">
-    <input name="ids" placeholder="1,2,3" style="flex:1">
-    <select name="role" style="width:auto"><option>member</option><option>moderator</option><option>admin</option></select>
-    <button type="submit">Set role</button>
+  <strong>Newest member:</strong> <a href="/user.php?u=<?= e($stats['newest']['username']) ?>">@<?= e($stats['newest']['username']) ?></a>
+  <span class="muted" style="margin-left:.5rem">· <?= time_ago((int)$stats['newest']['created_at']) ?></span>
+</div>
+<?php endif; ?>
+<h2 style="margin:1.5rem 0 1rem;font-size:1.15rem">Top users (by posts)</h2>
+<div class="glass">
+  <?php foreach ($topUsers as $tu): ?>
+    <a href="/user.php?u=<?= e($tu['username']) ?>" class="topic-row" style="text-decoration:none;color:inherit">
+      <?= user_avatar($tu['username'], $tu['avatar_color'] ?? '#6366f1', 32) ?>
+      <div class="info"><div class="title">@<?= e($tu['username']) ?></div></div>
+      <div class="counts"><div class="c"><strong><?= (int)$tu['cnt'] ?></strong>posts</div></div>
+    </a>
+  <?php endforeach; ?>
+</div>
+PHP
+
+  cat > "$APP_DIR/views/activity.php" <<'PHP'
+<?php /* @var array $topics @var array $posts */ ?>
+<div class="hero" style="padding:1.5rem 1rem">
+  <h1 style="font-size:2rem"><?= e(t('activity')) ?></h1>
+</div>
+<h2 style="margin:1.5rem 0 1rem;font-size:1.15rem"><?= e(t('recent_topics')) ?></h2>
+<div class="glass" style="margin-bottom:1.5rem">
+  <?php foreach ($topics as $t): ?>
+    <a href="/topic.php?id=<?= (int)$t['id'] ?>" class="topic-row" style="text-decoration:none;color:inherit">
+      <?= user_avatar($t['username'], '#6366f1', 32) ?>
+      <div class="info">
+        <div class="title"><?= e($t['title']) ?></div>
+        <div class="meta"><span>@<?= e($t['username']) ?></span><span>· <?= time_ago((int)$t['updated_at']) ?></span></div>
+      </div>
+    </a>
+  <?php endforeach; ?>
+</div>
+<h2 style="margin:1.5rem 0 1rem;font-size:1.15rem"><?= e(t('latest_posts')) ?></h2>
+<div class="glass">
+  <?php foreach ($posts as $p): ?>
+    <a href="/topic.php?id=<?= (int)$p['topic_id'] ?>" class="topic-row" style="text-decoration:none;color:inherit;display:block">
+      <?= user_avatar($p['username'], '#6366f1', 32) ?>
+      <div class="info">
+        <div class="title"><?= e($p['topic_title']) ?></div>
+        <div class="meta"><span>@<?= e($p['username']) ?></span><span>· <?= time_ago((int)$p['created_at']) ?></span></div>
+        <p style="margin:.5rem 0 0;color:var(--fg-muted);font-size:.9rem"><?= e(mb_substr($p['body'],0,140)) ?><?= mb_strlen($p['body'])>140?'…':'' ?></p>
+      </div>
+    </a>
+  <?php endforeach; ?>
+</div>
+PHP
+
+  cat > "$APP_DIR/views/admin.php" <<'PHP'
+<?php /* @var array $users @var array $audit @var string $appName @var string $appTagline */ ?>
+<h1 style="margin:0 0 1.5rem;font-size:1.75rem">Admin</h1>
+
+<div class="glass card" style="margin-bottom:1.5rem">
+  <h2 style="margin:0 0 1rem;font-size:1.2rem"><?= e(t('admin_settings')) ?></h2>
+  <form method="post" action="/admin.php" class="grid">
+    <?= csrf_field() ?><input type="hidden" name="action" value="save_settings">
+    <label class="text-sm">
+      <span class="muted" style="display:block;margin-bottom:.35rem"><?= e(t('site_name')) ?></span>
+      <input name="app_name" value="<?= e($appName) ?>" required maxlength="60">
+    </label>
+    <label class="text-sm">
+      <span class="muted" style="display:block;margin-bottom:.35rem"><?= e(t('site_tagline')) ?></span>
+      <input name="app_tagline" value="<?= e($appTagline) ?>" maxlength="160">
+    </label>
+    <button type="submit"><?= e(t('save')) ?></button>
   </form>
+</div>
+
+<div class="glass card" style="margin-bottom:1.5rem">
+  <h2 style="margin:0 0 1rem;font-size:1.2rem"><?= e(t('admin_users')) ?></h2>
+  <form method="post" action="/admin.php" class="flex flex-wrap" style="margin-bottom:1rem">
+    <?= csrf_field() ?><input type="hidden" name="action" value="bulk_role">
+    <input name="ids" placeholder="1,2,3" style="flex:1;min-width:120px">
+    <select name="role" style="width:auto"><option>member</option><option>moderator</option><option>admin</option></select>
+    <button type="submit" class="btn-sm">Set role</button>
+  </form>
+  <div style="overflow-x:auto">
   <table><thead><tr><th>ID</th><th>User</th><th>Email</th><th>Role</th></tr></thead><tbody>
     <?php foreach ($users as $u): ?>
-      <tr><td><?= (int)$u['id'] ?></td><td>@<?= e($u['username']) ?></td><td class="muted"><?= e($u['email']) ?></td><td><?= e($u['role']) ?></td></tr>
+      <tr><td><?= (int)$u['id'] ?></td><td><a href="/user.php?u=<?= e($u['username']) ?>">@<?= e($u['username']) ?></a></td><td class="muted"><?= e($u['email']) ?></td><td><span class="pill"><?= e($u['role']) ?></span></td></tr>
     <?php endforeach; ?>
   </tbody></table>
+  </div>
 </div>
+
 <div class="glass card">
-  <h2 style="margin:0 0 1rem;color:var(--fg)">Audit log (latest 50)</h2>
+  <h2 style="margin:0 0 1rem;font-size:1.2rem"><?= e(t('admin_audit')) ?></h2>
+  <div style="overflow-x:auto">
   <table><thead><tr><th>When</th><th>Actor</th><th>Action</th></tr></thead><tbody>
     <?php foreach ($audit as $a): ?>
       <tr><td class="muted"><?= date('Y-m-d H:i', (int)$a['ts']) ?></td><td><?= e($a['actor'] ?? '-') ?></td><td><?= e($a['action']) ?></td></tr>
     <?php endforeach; ?>
   </tbody></table>
+  </div>
 </div>
 PHP
+
+  cat > "$APP_DIR/views/404.php" <<'PHP'
+<div class="hero">
+  <h1 style="font-size:5rem;margin:0">404</h1>
+  <p style="margin:1rem 0 2rem"><?= e(t('not_found')) ?></p>
+  <a href="/" class="btn">← <?= e(t('home')) ?></a>
+</div>
+PHP
+
   chown -R root:root "$APP_DIR/views"; chmod -R 0755 "$APP_DIR/views"
   ok "views/"
 }
@@ -780,6 +1450,8 @@ write_public() {
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
 $cats = $db->query("SELECT c.*, (SELECT COUNT(*) FROM topics t WHERE t.category_id=c.id) AS n FROM categories c ORDER BY position, id")->fetchAll();
+$recent = recent_topics($db, 10);
+$stats = forum_stats($db);
 $title = t('forum');
 ob_start(); require LF_ROOT.'/views/home.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
@@ -811,7 +1483,11 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     if (!$email||$pass==='') $error=t('missing_info');
     else {
       $st=$db->prepare('SELECT * FROM users WHERE email=?'); $st->execute([$email]); $u=$st->fetch();
-      if ($u && password_verify_safe($pass,$u['password_hash'])) { auth_login($u); redirect('/'); }
+      if ($u && password_verify_safe($pass,$u['password_hash'])) {
+        auth_login($u);
+        $next = $_GET['next'] ?? '/';
+        redirect($next);
+      }
       $error=t('bad_credentials');
     }
   }
@@ -839,8 +1515,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     elseif (strlen($p)<10) $error=t('weak_password');
     else {
       try {
-        $db->prepare('INSERT INTO users(username,email,password_hash,created_at) VALUES(?,?,?,?)')
-           ->execute([$u,$em,password_hash_safe($p),time()]);
+        $db->prepare('INSERT INTO users(username,email,password_hash,created_at,last_seen_at) VALUES(?,?,?,?,?)')
+           ->execute([$u,$em,password_hash_safe($p),time(),time()]);
         $row=$db->prepare('SELECT * FROM users WHERE id=?'); $row->execute([$db->lastInsertId()]);
         auth_login($row->fetch()); redirect('/');
       } catch (PDOException) { $error=t('already_exists'); }
@@ -867,17 +1543,19 @@ $slug = trim((string)($_GET['slug'] ?? ''));
 if ($slug === '') { http_response_code(400); exit('Missing slug'); }
 $st = $db->prepare('SELECT * FROM categories WHERE slug = ?');
 $st->execute([$slug]); $cat = $st->fetch();
-if (!$cat) { http_response_code(404); exit('Category not found'); }
+if (!$cat) { http_response_code(404); require LF_ROOT.'/views/404.php'; exit; }
 $page = max(1, (int)($_GET['page'] ?? 1));
 $per = 25; $off = ($page - 1) * $per;
+$cnt = $db->prepare('SELECT COUNT(*) FROM topics WHERE category_id=?'); $cnt->execute([(int)$cat['id']]);
+$total = (int)$cnt->fetchColumn();
 $tst = $db->prepare(
-  'SELECT t.*, u.username, (SELECT COUNT(*) FROM posts p WHERE p.topic_id = t.id) AS post_count
+  'SELECT t.*, u.username, u.avatar_color, (SELECT COUNT(*) FROM posts p WHERE p.topic_id = t.id) AS post_count
    FROM topics t JOIN users u ON u.id = t.user_id
    WHERE t.category_id = ? ORDER BY t.is_pinned DESC, t.updated_at DESC LIMIT ? OFFSET ?'
 );
 $tst->execute([(int)$cat['id'], $per, $off]);
 $topics = $tst->fetchAll();
-$title = $cat['name_'.($_SESSION['ui_lang'] ?? 'tr')] ?? $cat['name_en'];
+$title = cat_name($cat, $_SESSION['ui_lang'] ?? 'tr');
 ob_start(); require LF_ROOT.'/views/category.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
 PHP
@@ -888,9 +1566,20 @@ declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
 $id = (int)($_GET['id'] ?? 0);
 if ($id <= 0) { http_response_code(400); exit('Missing id'); }
-$tst = $db->prepare('SELECT t.*, u.username FROM topics t JOIN users u ON u.id=t.user_id WHERE t.id=?');
+$tst = $db->prepare('SELECT t.*, u.username, c.slug AS cat_slug FROM topics t JOIN users u ON u.id=t.user_id JOIN categories c ON c.id=t.category_id WHERE t.id=?');
 $tst->execute([$id]); $topic = $tst->fetch();
-if (!$topic) { http_response_code(404); exit('Topic not found'); }
+if (!$topic) { http_response_code(404); require LF_ROOT.'/views/404.php'; exit; }
+// Increment views (once per session per topic)
+$skey = 'viewed_' . $id;
+if (empty($_SESSION[$skey])) {
+  $db->prepare('UPDATE topics SET views=views+1 WHERE id=?')->execute([$id]);
+  $_SESSION[$skey] = true;
+  $topic['views'] = (int)$topic['views'] + 1;
+}
+$catSt = $db->prepare('SELECT * FROM categories WHERE id=?'); $catSt->execute([(int)$topic['category_id']]);
+$cat = $catSt->fetch();
+$topic['cat_name'] = cat_name($cat, $_SESSION['ui_lang'] ?? 'tr');
+
 $u = auth_user();
 if ($_SERVER['REQUEST_METHOD']==='POST' && $u) {
   csrf_verify();
@@ -898,8 +1587,13 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && $u) {
   if ($action === 'toggle_watch') {
     $w = $db->prepare('SELECT 1 FROM topic_watches WHERE user_id=? AND topic_id=?');
     $w->execute([(int)$u['id'], $id]);
-    if ($w->fetchColumn()) $db->prepare('DELETE FROM topic_watches WHERE user_id=? AND topic_id=?')->execute([(int)$u['id'], $id]);
-    else $db->prepare('INSERT INTO topic_watches(user_id,topic_id,created_at) VALUES(?,?,?)')->execute([(int)$u['id'], $id, time()]);
+    if ($w->fetchColumn()) {
+      $db->prepare('DELETE FROM topic_watches WHERE user_id=? AND topic_id=?')->execute([(int)$u['id'], $id]);
+      flash_set('ok', 'Takip bırakıldı.');
+    } else {
+      $db->prepare('INSERT INTO topic_watches(user_id,topic_id,created_at) VALUES(?,?,?)')->execute([(int)$u['id'], $id, time()]);
+      flash_set('ok', 'Takip ediliyor.');
+    }
   } elseif ($action === 'reply' && empty($topic['is_locked'])) {
     $body = trim((string)($_POST['body'] ?? ''));
     if ($body !== '' && rate_limit($db,'post',client_ip(),$config['rate_limit']['post_per_min'],60)) {
@@ -913,8 +1607,26 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && $u) {
   }
   redirect('/topic.php?id='.$id);
 }
-$pst = $db->prepare('SELECT p.*, u.username FROM posts p JOIN users u ON u.id=p.user_id WHERE p.topic_id=? ORDER BY p.created_at ASC');
+
+$pst = $db->prepare('SELECT p.*, u.username, u.avatar_color FROM posts p JOIN users u ON u.id=p.user_id WHERE p.topic_id=? ORDER BY p.created_at ASC');
 $pst->execute([$id]); $posts = $pst->fetchAll();
+
+// Fetch reactions grouped by post
+$reactions = [];
+$myReacted = [];
+if (!empty($posts)) {
+  $pids = array_map(fn($p) => (int)$p['id'], $posts);
+  $ph = implode(',', array_fill(0, count($pids), '?'));
+  $rs = $db->prepare("SELECT post_id, emoji, COUNT(*) AS c FROM post_reactions WHERE post_id IN ($ph) GROUP BY post_id, emoji");
+  $rs->execute($pids);
+  foreach ($rs->fetchAll() as $r) { $reactions[(int)$r['post_id']][$r['emoji']] = (int)$r['c']; }
+  if ($u) {
+    $rs2 = $db->prepare("SELECT post_id, emoji FROM post_reactions WHERE user_id=? AND post_id IN ($ph)");
+    $rs2->execute(array_merge([(int)$u['id']], $pids));
+    foreach ($rs2->fetchAll() as $r) { $myReacted[(int)$r['post_id']][] = $r['emoji']; }
+  }
+}
+
 $watching = false;
 if ($u) {
   $w = $db->prepare('SELECT 1 FROM topic_watches WHERE user_id=? AND topic_id=?');
@@ -933,14 +1645,15 @@ $u = auth_require();
 $catId = (int)($_GET['cat'] ?? 0);
 $st = $db->prepare('SELECT * FROM categories WHERE id=?');
 $st->execute([$catId]); $cat = $st->fetch();
-if (!$cat) { http_response_code(404); exit('Category not found'); }
+if (!$cat) { http_response_code(404); require LF_ROOT.'/views/404.php'; exit; }
 $error = '';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
   $title = trim((string)($_POST['title'] ?? ''));
   $body  = trim((string)($_POST['body'] ?? ''));
   if (strlen($title) < 3 || $body === '') $error = 'Başlık ve içerik gerekli.';
-  elseif (rate_limit($db,'post',client_ip(),$config['rate_limit']['post_per_min'],60)) {
+  elseif (!rate_limit($db,'post',client_ip(),$config['rate_limit']['post_per_min'],60)) $error = 'Çok hızlı. Biraz bekleyin.';
+  else {
     $slug = preg_replace('/[^a-z0-9]+/', '-', strtolower($title));
     $db->prepare('INSERT INTO topics(category_id,user_id,title,slug,created_at,updated_at) VALUES(?,?,?,?,?,?)')
        ->execute([$catId, (int)$u['id'], $title, $slug, time(), time()]);
@@ -948,8 +1661,6 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $db->prepare('INSERT INTO posts(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)')
        ->execute([$tid, (int)$u['id'], $body, time(), time()]);
     redirect('/topic.php?id='.$tid);
-  } else {
-    $error = 'Çok hızlı. Biraz bekleyin.';
   }
 }
 $title = t('new_topic');
@@ -972,7 +1683,7 @@ if ($author !== '') {
 $page = max(1, (int)($_GET['page'] ?? 1));
 $result = $q !== '' ? search_posts($db, $q, $catId, $authorId ? (int)$authorId : null, $page, 20) : ['rows'=>[], 'total'=>0];
 $cats = $db->query('SELECT * FROM categories ORDER BY position, id')->fetchAll();
-$title = t('search_results');
+$title = t('search');
 ob_start(); require LF_ROOT.'/views/search.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
 PHP
@@ -1001,17 +1712,98 @@ $u = auth_require();
 $row = $db->prepare('SELECT * FROM users WHERE id=?'); $row->execute([(int)$u['id']]); $user = $row->fetch();
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
+  $bio = mb_substr(trim((string)($_POST['bio'] ?? '')), 0, 500);
   $theme = in_array($_POST['theme']??'', $config['themes'], true) ? $_POST['theme'] : 'dark';
   $accent = in_array($_POST['accent']??'', $config['accents'], true) ? $_POST['accent'] : 'indigo';
+  $avatarColor = preg_match('/^#[0-9a-fA-F]{6}$/', $_POST['avatar_color'] ?? '') ? $_POST['avatar_color'] : '#6366f1';
   $nm = isset($_POST['notify_mentions']) ? 1 : 0;
   $nr = isset($_POST['notify_replies']) ? 1 : 0;
-  $db->prepare('UPDATE users SET theme=?, accent=?, notify_mentions=?, notify_replies=? WHERE id=?')
-     ->execute([$theme, $accent, $nm, $nr, (int)$u['id']]);
+  $nd = isset($_POST['notify_digest']) ? 1 : 0;
+  $db->prepare('UPDATE users SET bio=?, theme=?, accent=?, avatar_color=?, notify_mentions=?, notify_replies=?, notify_digest=? WHERE id=?')
+     ->execute([$bio, $theme, $accent, $avatarColor, $nm, $nr, $nd, (int)$u['id']]);
+  // CRITICAL: update session cache so theme_css_vars() reflects changes immediately
+  $_SESSION['user']['theme'] = $theme;
+  $_SESSION['user']['accent'] = $accent;
+  $_SESSION['user']['bio'] = $bio;
+  $_SESSION['user']['avatar_color'] = $avatarColor;
+  $_SESSION['user']['notify_mentions'] = $nm;
+  $_SESSION['user']['notify_replies'] = $nr;
+  $_SESSION['user']['notify_digest'] = $nd;
+  audit($db, $u, 'user.settings_update');
+  flash_set('ok', t('settings_saved'));
   redirect('/settings.php');
 }
 $title = t('settings');
 ob_start(); require LF_ROOT.'/views/settings.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
+PHP
+
+  cat > "$APP_DIR/public/user.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+$uname = trim((string)($_GET['u'] ?? ''));
+if ($uname === '') { http_response_code(400); exit('Missing username'); }
+$st = $db->prepare('SELECT * FROM users WHERE username=?');
+$st->execute([$uname]); $profile = $st->fetch();
+if (!$profile) { http_response_code(404); require LF_ROOT.'/views/404.php'; exit; }
+$tst = $db->prepare('SELECT t.*, c.slug AS cat_slug FROM topics t JOIN categories c ON c.id=t.category_id WHERE t.user_id=? ORDER BY t.updated_at DESC LIMIT 20');
+$tst->execute([(int)$profile['id']]); $topics = $tst->fetchAll();
+foreach ($topics as &$t) {
+  $catSt = $db->prepare('SELECT * FROM categories WHERE id=?'); $catSt->execute([(int)$t['category_id']]);
+  $cat = $catSt->fetch();
+  $t['cat_name'] = cat_name($cat, $_SESSION['ui_lang'] ?? 'tr');
+}
+$pst = $db->prepare('SELECT p.*, t.title AS topic_title FROM posts p JOIN topics t ON t.id=p.topic_id WHERE p.user_id=? ORDER BY p.created_at DESC LIMIT 20');
+$pst->execute([(int)$profile['id']]); $posts = $pst->fetchAll();
+$title = '@' . $profile['username'];
+ob_start(); require LF_ROOT.'/views/user.php'; $content = ob_get_clean();
+require LF_ROOT.'/views/layout.php';
+PHP
+
+  cat > "$APP_DIR/public/stats.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+$stats = forum_stats($db);
+$topUsers = $db->query('SELECT u.username, u.avatar_color, COUNT(p.id) AS cnt FROM users u LEFT JOIN posts p ON p.user_id=u.id GROUP BY u.id ORDER BY cnt DESC LIMIT 10')->fetchAll();
+$title = t('stats');
+ob_start(); require LF_ROOT.'/views/stats.php'; $content = ob_get_clean();
+require LF_ROOT.'/views/layout.php';
+PHP
+
+  cat > "$APP_DIR/public/activity.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+$topics = recent_topics($db, 15);
+$posts = recent_posts($db, 15);
+$title = t('activity');
+ob_start(); require LF_ROOT.'/views/activity.php'; $content = ob_get_clean();
+require LF_ROOT.'/views/layout.php';
+PHP
+
+  cat > "$APP_DIR/public/react.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+if ($_SERVER['REQUEST_METHOD']!=='POST') { http_response_code(405); exit; }
+$u = auth_require();
+csrf_verify();
+$postId = (int)($_POST['post_id'] ?? 0);
+$emoji = (string)($_POST['emoji'] ?? '');
+$back = (string)($_POST['back'] ?? '/');
+if ($postId > 0 && in_array($emoji, ['👍','❤️','🔥','😂','😮'], true)
+    && rate_limit($db,'react',client_ip(),$config['rate_limit']['react_per_min'],60)) {
+  $st = $db->prepare('SELECT 1 FROM post_reactions WHERE post_id=? AND user_id=? AND emoji=?');
+  $st->execute([$postId, (int)$u['id'], $emoji]);
+  if ($st->fetchColumn()) {
+    $db->prepare('DELETE FROM post_reactions WHERE post_id=? AND user_id=? AND emoji=?')->execute([$postId, (int)$u['id'], $emoji]);
+  } else {
+    $db->prepare('INSERT INTO post_reactions(post_id,user_id,emoji,created_at) VALUES(?,?,?,?)')->execute([$postId, (int)$u['id'], $emoji, time()]);
+  }
+}
+redirect($back);
 PHP
 
   cat > "$APP_DIR/public/admin.php" <<'PHP'
@@ -1029,12 +1821,21 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       $db->prepare('UPDATE users SET role=? WHERE id=?')->execute([$role, $id]);
       audit($db, $u, 'user.role_set', 'user', $id, ['role'=>$role]);
     }
+    flash_set('ok', 'Roles updated.');
+  } elseif ($action === 'save_settings') {
+    $name = trim((string)($_POST['app_name'] ?? ''));
+    $tagline = trim((string)($_POST['app_tagline'] ?? ''));
+    if ($name !== '') settings_set($db, 'app_name', mb_substr($name, 0, 60));
+    settings_set($db, 'app_tagline', mb_substr($tagline, 0, 160));
+    audit($db, $u, 'site.settings');
+    flash_set('ok', t('settings_saved'));
   }
   redirect('/admin.php');
 }
 $users = $db->query('SELECT id,username,email,role FROM users ORDER BY id DESC LIMIT 200')->fetchAll();
-$cats  = $db->query('SELECT * FROM categories ORDER BY position, id')->fetchAll();
 $audit = $db->query('SELECT a.*, u.username AS actor FROM audit_log a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.ts DESC LIMIT 50')->fetchAll();
+$appName = $GLOBALS['__app_name'];
+$appTagline = $GLOBALS['__app_tagline'];
 $title = 'Admin';
 ob_start(); require LF_ROOT.'/views/admin.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
@@ -1078,8 +1879,8 @@ $username=$u2['preferred_username'] ?? ('ed_'.substr(hash('sha256',$sub),0,10));
 $st=$db->prepare('SELECT * FROM users WHERE erendev_sub=? OR email=?');
 $st->execute([$sub,$email]); $user=$st->fetch();
 if (!$user) {
-  $db->prepare('INSERT INTO users(username,email,password_hash,erendev_sub,created_at) VALUES(?,?,?,?,?)')
-     ->execute([$username,$email,password_hash_safe(bin2hex(random_bytes(24))),$sub,time()]);
+  $db->prepare('INSERT INTO users(username,email,password_hash,erendev_sub,created_at,last_seen_at) VALUES(?,?,?,?,?,?)')
+     ->execute([$username,$email,password_hash_safe(bin2hex(random_bytes(24))),$sub,time(),time()]);
   $st=$db->prepare('SELECT * FROM users WHERE id=?'); $st->execute([$db->lastInsertId()]); $user=$st->fetch();
 } else {
   $db->prepare('UPDATE users SET erendev_sub=? WHERE id=?')->execute([$sub,$user['id']]);
@@ -1087,13 +1888,21 @@ if (!$user) {
 auth_login($user); redirect('/');
 PHP
 
+  cat > "$APP_DIR/public/404.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+http_response_code(404);
+ob_start(); require LF_ROOT.'/views/404.php'; $content = ob_get_clean();
+require LF_ROOT.'/views/layout.php';
+PHP
+
   chown -R root:root "$APP_DIR/public"
   find "$APP_DIR/public" -type d -exec chmod 0755 {} \;
   find "$APP_DIR/public" -type f -exec chmod 0644 {} \;
 
-  # Verify critical files exist
-  for f in index.php category.php topic.php new-topic.php login.php register.php search.php admin.php; do
-    [[ -f "$APP_DIR/public/$f" ]] || die "CRITICAL: $APP_DIR/public/$f missing after write_public"
+  for f in index.php category.php topic.php new-topic.php login.php register.php search.php user.php stats.php activity.php react.php admin.php notifications.php settings.php; do
+    [[ -f "$APP_DIR/public/$f" ]] || die "CRITICAL: $APP_DIR/public/$f missing"
   done
   ok "public/ (all critical files verified)"
 }
@@ -1101,97 +1910,92 @@ PHP
 write_nginx() {
   install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
   SOCK="/run/php/${PHP_VER}-fpm-liteforum.sock"
+  HAS_TLS=0
+  [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]] && HAS_TLS=1
+  [[ $SKIP_TLS -eq 1 ]] && HAS_TLS=0
 
-  cat > "/etc/nginx/sites-available/liteforum" <<NGINX
+  if [[ $HAS_TLS -eq 1 ]]; then
+    cat > "/etc/nginx/sites-available/liteforum" <<NGINX
+limit_req_zone \$binary_remote_addr zone=lf_login:10m rate=10r/m;
+
+server {
+  listen 80; listen [::]:80;
+  server_name $DOMAIN;
+  location /.well-known/acme-challenge/ { allow all; }
+  location / { return 301 https://\$host\$request_uri; }
+}
+
+server {
+  listen 443 ssl http2;
+  listen [::]:443 ssl http2;
+  server_name $DOMAIN;
+  root $APP_DIR/public; index index.php;
+  server_tokens off; charset utf-8;
+  client_max_body_size 10m;
+  ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_prefer_server_ciphers off;
+  ssl_session_cache shared:SSL:10m;
+  ssl_session_timeout 1d;
+  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+  add_header X-Frame-Options "DENY" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
+  location = /favicon.ico { access_log off; return 204; }
+  location = /login.php { limit_req zone=lf_login burst=5 nodelay; fastcgi_pass unix:$SOCK; include fastcgi_params; fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name; fastcgi_param HTTP_PROXY ""; }
+  location ~ \.php\$ {
+    try_files \$uri =404;
+    fastcgi_pass unix:$SOCK;
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    fastcgi_param HTTP_PROXY "";
+    fastcgi_read_timeout 30s;
+  }
+  location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+  location ~ /\.(?!well-known) { deny all; }
+  location ~* \.(env|log|sqlite|db|sql|bak|ini|conf|md|git)\$ { deny all; }
+  location ~ /(config|app|lang|views|storage)/ { deny all; }
+  access_log $LOG_DIR/access.log; error_log $LOG_DIR/error.log warn;
+}
+NGINX
+  else
+    cat > "/etc/nginx/sites-available/liteforum" <<NGINX
 limit_req_zone \$binary_remote_addr zone=lf_login:10m rate=10r/m;
 
 server {
   listen 80 default_server;
   listen [::]:80 default_server;
   server_name $DOMAIN;
-  root $APP_DIR/public;
-  index index.php;
-
-  location /.well-known/acme-challenge/ { allow all; }
-  location / { return 301 https://\$host\$request_uri; }
-}
-
-server {
-  listen 443 ssl http2 default_server;
-  listen [::]:443 ssl http2 default_server;
-  server_name $DOMAIN;
-  root $APP_DIR/public;
-  index index.php;
-  server_tokens off;
-  charset utf-8;
+  root $APP_DIR/public; index index.php;
+  server_tokens off; charset utf-8;
   client_max_body_size 10m;
-  client_body_timeout 15s;
-  client_header_timeout 15s;
-  send_timeout 20s;
-  keepalive_timeout 30s;
-
-  ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-  ssl_protocols TLSv1.2 TLSv1.3;
-  ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-  ssl_prefer_server_ciphers off;
-  ssl_session_cache shared:SSL:10m;
-  ssl_session_timeout 1d;
-  ssl_session_tickets off;
-
-  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
   add_header X-Frame-Options "DENY" always;
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz; connect-src 'self'" always;
-
-  location = /favicon.ico { access_log off; log_not_found off; return 204; }
-
-  location = /login.php {
-    limit_req zone=lf_login burst=5 nodelay;
-    fastcgi_pass unix:$SOCK;
-    include fastcgi_params;
-    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    fastcgi_param HTTP_PROXY "";
-    fastcgi_hide_header X-Powered-By;
-  }
-
-  location ~ \.php$ {
+  location = /favicon.ico { access_log off; return 204; }
+  location = /login.php { limit_req zone=lf_login burst=5 nodelay; fastcgi_pass unix:$SOCK; include fastcgi_params; fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name; fastcgi_param HTTP_PROXY ""; }
+  location ~ \.php\$ {
     try_files \$uri =404;
     fastcgi_pass unix:$SOCK;
     include fastcgi_params;
     fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
     fastcgi_param HTTP_PROXY "";
-    fastcgi_hide_header X-Powered-By;
     fastcgi_read_timeout 30s;
   }
-
-  location / {
-    try_files \$uri \$uri/ /index.php?\$query_string;
-  }
-
+  location / { try_files \$uri \$uri/ /index.php?\$query_string; }
   location ~ /\.(?!well-known) { deny all; }
-  location ~* \.(env|log|sqlite|db|sql|bak|ini|conf|md|git)$ { deny all; }
+  location ~* \.(env|log|sqlite|db|sql|bak|ini|conf|md|git)\$ { deny all; }
   location ~ /(config|app|lang|views|storage)/ { deny all; }
-
-  access_log $LOG_DIR/access.log;
-  error_log  $LOG_DIR/error.log warn;
+  access_log $LOG_DIR/access.log; error_log $LOG_DIR/error.log warn;
 }
 NGINX
-
-  if [[ $SKIP_TLS -eq 1 ]] || [[ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
-    sed -i 's/listen 443 ssl http2 default_server;/listen 80 default_server;/' /etc/nginx/sites-available/liteforum
-    sed -i 's/listen \[::\]:443 ssl http2 default_server;//' /etc/nginx/sites-available/liteforum
-    sed -i '/ssl_/d' /etc/nginx/sites-available/liteforum
-    sed -i '/Strict-Transport-Security/d' /etc/nginx/sites-available/liteforum
-    sed -i 's/return 301 https:\/\/\$host\$request_uri;//' /etc/nginx/sites-available/liteforum
-    # Remove the first (redirect) server block if we're HTTP-only
-    awk 'BEGIN{RS="server \\{";ORS="server {"} NR>1{if(prev ~ /return 301 https/) {next} print prev; prev=$0} END{print prev}' /etc/nginx/sites-available/liteforum > /tmp/lf-nginx 2>/dev/null || true
   fi
 
   ln -sf /etc/nginx/sites-available/liteforum /etc/nginx/sites-enabled/liteforum
-  rm -f /etc/nginx/sites-enabled/default
-  ok "Nginx config written"
+  rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/liteforum.http
+  ok "Nginx config ($([ $HAS_TLS -eq 1 ] && echo https || echo http))"
 }
 
 write_phpfpm() {
@@ -1215,7 +2019,6 @@ php_admin_flag[log_errors] = on
 php_admin_flag[display_errors] = off
 php_admin_flag[expose_php] = off
 php_admin_flag[allow_url_include] = off
-php_admin_flag[allow_url_fopen] = off
 php_admin_value[open_basedir] = $APP_DIR:$DATA_DIR:/tmp:/var/log/liteforum
 php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,show_source,phpinfo
 php_admin_value[upload_tmp_dir] = $DATA_DIR/tmp
@@ -1237,8 +2040,7 @@ FPM
 setup_ufw() {
   [[ $NO_FIREWALL -eq 1 ]] && { warn "UFW skipped"; return; }
   ufw --force reset >/dev/null 2>&1 || true
-  ufw default deny incoming
-  ufw default allow outgoing
+  ufw default deny incoming; ufw default allow outgoing
   ufw allow 22/tcp comment 'SSH'
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
@@ -1247,7 +2049,7 @@ setup_ufw() {
 }
 
 setup_fail2ban() {
-  install -d -o root -g root -m 0755 /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+  install -d -o root -g root -m 0755 /etc/fail2ban/jail.d
   cat > /etc/fail2ban/jail.d/liteforum.local <<'F2B'
 [sshd]
 enabled = true
@@ -1280,49 +2082,36 @@ SYS
 setup_tls() {
   [[ $SKIP_TLS -eq 1 ]] && { warn "TLS skipped"; return; }
   install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
-
-  # HTTP-only config for ACME challenge
   cat > /etc/nginx/sites-available/liteforum.http <<HTTP
-server {
-  listen 80;
-  server_name $DOMAIN;
-  root $APP_DIR/public;
+server { listen 80; server_name $DOMAIN; root $APP_DIR/public;
   location /.well-known/acme-challenge/ { allow all; }
-  location / { return 301 https://\$host\$request_uri; }
-}
+  location / { return 301 https://\$host\$request_uri; } }
 HTTP
   ln -sf /etc/nginx/sites-available/liteforum.http /etc/nginx/sites-enabled/liteforum.http
   rm -f /etc/nginx/sites-enabled/liteforum
-  nginx -t 2>/dev/null && systemctl reload nginx
-
+  nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
   if certbot --nginx -d "$DOMAIN" -m "$EMAIL" --agree-tos --non-interactive --redirect 2>&1 | tee -a "$INSTALL_LOG"; then
     ok "TLS issued"
-    rm -f /etc/nginx/sites-enabled/liteforum.http
-    ln -sf /etc/nginx/sites-available/liteforum /etc/nginx/sites-enabled/liteforum
-    nginx -t && systemctl reload nginx
     systemctl enable --now certbot.timer 2>/dev/null || true
   else
-    warn "Certbot failed — continuing with HTTP only"
-    rm -f /etc/nginx/sites-enabled/liteforum.http
-    # Rebuild nginx config in HTTP-only mode
-    write_nginx
-    ln -sf /etc/nginx/sites-available/liteforum /etc/nginx/sites-enabled/liteforum
-    nginx -t && systemctl reload nginx
+    warn "Certbot failed — continuing with HTTP"
+    SKIP_TLS=1
   fi
+  rm -f /etc/nginx/sites-enabled/liteforum.http
 }
 
 seed_data() {
   DB="$DATA_DIR/liteforum.db"
   sqlite3 "$DB" <<SQL
-INSERT OR IGNORE INTO categories(slug,name_tr,name_en,position) VALUES
- ('general','Genel','General',10),
- ('announcements','Duyurular','Announcements',20),
- ('support','Destek','Support',30);
+INSERT OR IGNORE INTO categories(slug,name_tr,name_en,name_fr,name_de,name_es,name_ar,description_tr,description_en,icon,position) VALUES
+ ('general','Genel','General','Général','Allgemein','General','عام','Genel tartışmalar','General discussions','💬',10),
+ ('announcements','Duyurular','Announcements','Annonces','Ankündigungen','Anuncios','إعلانات','Resmi duyurular','Official announcements','📢',20),
+ ('support','Destek','Support','Support','Hilfe','Soporte','دعم','Yardım ve destek','Help and support','🛠️',30);
 SQL
   HASH="$(php -r 'echo password_hash($argv[1], PASSWORD_ARGON2ID);' "$ADMIN_PASS")"
   sqlite3 "$DB" <<SQL
-INSERT INTO users(username,email,password_hash,role,created_at)
-VALUES('admin','$ADMIN_EMAIL','$HASH','admin',strftime('%s','now'))
+INSERT INTO users(username,email,password_hash,role,created_at,last_seen_at)
+VALUES('admin','$ADMIN_EMAIL','$HASH','admin',strftime('%s','now'),strftime('%s','now'))
 ON CONFLICT(email) DO UPDATE SET role='admin';
 SQL
   chown "$SVC_USER:$SVC_USER" "$DB"* 2>/dev/null; chmod 0600 "$DB"* 2>/dev/null
@@ -1339,24 +2128,14 @@ start_services() {
 
 verify_site() {
   sleep 2
-  # Local check via host header
-  if curl -fsS -H "Host: $DOMAIN" "http://127.0.0.1/" -o /dev/null 2>/dev/null; then
-    ok "HTTP homepage OK"
-  else
-    warn "HTTP homepage check failed — check /var/log/liteforum/error.log"
-  fi
-  # Verify category.php responds via HTTP
-  if curl -fsS -H "Host: $DOMAIN" "http://127.0.0.1/category.php?slug=general" -o /dev/null 2>/dev/null; then
-    ok "category.php OK"
-  else
-    warn "category.php check failed — investigate /var/log/liteforum/error.log"
-  fi
-  # Verify topic endpoint reachable
-  if curl -fsS -H "Host: $DOMAIN" "http://127.0.0.1/login.php" -o /dev/null 2>/dev/null; then
-    ok "login.php OK"
-  else
-    warn "login.php check failed"
-  fi
+  local base="http://127.0.0.1"
+  for path in "/" "/category.php?slug=general" "/login.php" "/register.php" "/activity.php" "/stats.php"; do
+    if curl -fsS -H "Host: $DOMAIN" "$base$path" -o /dev/null 2>/dev/null; then
+      ok "HTTP $path"
+    else
+      warn "HTTP $path FAILED — check /var/log/liteforum/error.log"
+    fi
+  done
 }
 
 [[ $DRY_RUN -eq 1 ]] && {
@@ -1390,7 +2169,7 @@ setup_fail2ban
 setup_sysctl
 seed_data
 setup_tls
-write_nginx          # ensure final config matches TLS status
+write_nginx
 start_services
 verify_site
 
@@ -1398,9 +2177,9 @@ CRED_FILE="/root/liteforum-credentials.txt"
 cat > "$CRED_FILE" <<EOF
 LiteForum Installation
 ======================
-URL             : https://$DOMAIN  (or http:// if TLS failed)
+URL             : $([ $SKIP_TLS -eq 1 ] && echo http || echo https)://$DOMAIN
 Install lang    : $LANG_CODE
-ErenDev OAuth   : $([[ $LANG_CODE == tr ]] && echo "shown only when UI=tr" || echo "hidden (credentials not present)")
+ErenDev OAuth   : $([[ $LANG_CODE == tr ]] && echo "shown only when UI=tr" || echo "hidden (no credentials)")
 Admin email     : $ADMIN_EMAIL
 Admin password  : $ADMIN_PASS
 App key         : $APP_KEY
@@ -1409,17 +2188,28 @@ OAuth secret    : $OAuth_CLIENT_SECRET
 DB              : $DATA_DIR/liteforum.db
 Logs            : $LOG_DIR
 
+Features:
+  ✓ Multi-language UI (tr/en/fr/de/es/ar) — switcher in header
+  ✓ Per-user theme + accent color
+  ✓ Site name editable from /admin.php
+  ✓ Notifications, mentions, reply-watch
+  ✓ Reactions (👍❤️🔥😂😮)
+  ✓ User profiles with bio + avatar color
+  ✓ FTS5 search with bm25 ranking
+  ✓ Activity feed, stats, online counter
+  ✓ Audit log, bulk role management
+  ✓ Markdown-lite in posts
+
 Troubleshooting:
-  - If site shows 404: sudo tail -30 /var/log/liteforum/error.log
-  - Verify files exist: ls -la $APP_DIR/public/
-  - Verify sockets: ls /run/php/
-  - Reload: sudo systemctl reload nginx $PHP_VER-fpm
+  sudo tail -30 /var/log/liteforum/error.log
+  ls -la $APP_DIR/public/
+  sudo systemctl status nginx $PHP_VER-fpm
 EOF
 chmod 0600 "$CRED_FILE"
 
 echo
 echo "============================================================"
-echo " LiteForum ready → https://$DOMAIN"
+echo " LiteForum ready → $([ $SKIP_TLS -eq 1 ] && echo http || echo https)://$DOMAIN"
 echo " Admin: $ADMIN_EMAIL / $ADMIN_PASS"
 echo " Credentials: $CRED_FILE"
 echo "============================================================"
