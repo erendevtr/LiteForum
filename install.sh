@@ -2,7 +2,7 @@
 # =============================================================================
 # LiteForum — Ultra-Secure One-Shot Installer
 # Single-command usage:
-#   curl -fsSL https://erendev.github.io/install.sh | sudo bash -s -- \
+#   curl -fsSL https:/get.erendev.xyz/install.sh | sudo bash -s -- \
 #        --domain forum.example.com --email you@example.com --lang tr --admin admin@example.com
 # =============================================================================
 set -Eeuo pipefail
