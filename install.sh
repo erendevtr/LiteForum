@@ -8,7 +8,7 @@ set -Eeuo pipefail
 umask 027
 
 DOMAIN=""; ADMIN_EMAIL=""; EMAIL=""
-LANG_CODE="tr"                 # tr | en — ErenDev button is rendered ONLY when this is 'tr'
+LANG_CODE="tr"                 # tr | en — ErenDev button is rendered ONLY when install=tr AND ui=tr
 DRY_RUN=0; SKIP_TLS=0; NO_FIREWALL=0
 APP_DIR="/var/www/liteforum"; DATA_DIR="/var/lib/liteforum"; LOG_DIR="/var/log/liteforum"
 SVC_USER="liteforum"; PHP_VER=""; INSTALL_LOG="/var/log/liteforum-install.log"
@@ -23,7 +23,7 @@ LiteForum Installer (English)
   --domain <fqdn>       Domain (Let's Encrypt TLS is provisioned automatically)
   --email <mail>        Contact email for Let's Encrypt + admin
   --admin <mail>        Admin email (password is auto-generated)
-  --lang <tr|en>        Install language — 'tr' shows ErenDev OAuth, 'en' never renders it
+  --lang <tr|en>        Install language — 'tr' shows ErenDev OAuth (UI must also be tr)
   --skip-tls            Skip TLS (HTTP only, HSTS disabled)
   --no-firewall         Skip UFW setup
   --dry-run             Print plan only
@@ -46,6 +46,20 @@ ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${DOMAIN}}"; EMAIL="${EMAIL:-$ADMIN_EMAIL}"
 
 log "LiteForum installer starting — domain=$DOMAIN lang=$LANG_CODE admin=$ADMIN_EMAIL dry-run=$DRY_RUN"
 
+# ---------------------------------------------------------------------------
+# Pre-flight: ensure the sqlite3 CLI exists before we get deep into the script
+# ---------------------------------------------------------------------------
+preflight() {
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    log "sqlite3 CLI not found — installing it now..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y -qq
+    apt-get install -y -qq sqlite3 || die "Failed to install sqlite3 CLI"
+  fi
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 CLI still missing after install"
+  ok "sqlite3 CLI available: $(sqlite3 --version | awk '{print $1}')"
+}
+
 detect_os() {
   . /etc/os-release
   case "$ID" in ubuntu|debian) ;; *) die "Only Ubuntu/Debian are supported. Found: $ID";; esac
@@ -61,14 +75,23 @@ install_packages() {
   PHP_VER="$(apt-cache search --names-only '^php[0-9]+\.[0-9]+-fpm$' | sort -V | tail -1 | awk -F- '{print $1}')"
   [[ -n "$PHP_VER" ]] || PHP_VER="php8.2"
   log "PHP version: $PHP_VER"
-  apt-get install -y -qq --no-install-recommends \
+
+  # Core packages — no --no-install-recommends so sqlite3 and nginx helpers come in cleanly
+  apt-get install -y -qq \
     nginx "$PHP_VER-fpm" "$PHP_VER-cli" "$PHP_VER-sqlite3" "$PHP_VER-curl" \
     "$PHP_VER-mbstring" "$PHP_VER-xml" "$PHP_VER-intl" "$PHP_VER-opcache" \
-    "$PHP_VER-bcmath" "$PHP_VER-gd" sqlite3 curl ca-certificates openssl \
-    ufw fail2ban unattended-upgrades apt-listchanges certbot python3-certbot-nginx \
-    logrotate rsync jq libnginx-mod-http-headers-more-filter libnginx-mod-http-limit-req \
-    2>>"$INSTALL_LOG" || true
-  ok "Packages installed"
+    "$PHP_VER-bcmath" "$PHP_VER-gd" \
+    sqlite3 curl ca-certificates openssl \
+    ufw fail2ban unattended-upgrades apt-listchanges \
+    certbot python3-certbot-nginx \
+    logrotate rsync jq 2>>"$INSTALL_LOG" || true
+
+  # Optional Nginx helper modules — tolerate failure on distros without them
+  apt-get install -y -qq libnginx-mod-http-headers-more-filter libnginx-mod-http-limit-req \
+    2>>"$INSTALL_LOG" || warn "Optional nginx modules not installed (non-fatal)"
+
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 still missing after package install"
+  ok "Packages installed (sqlite3 OK)"
 }
 
 create_user() {
@@ -94,6 +117,7 @@ gen_secrets() {
 init_sqlite() {
   DB="$DATA_DIR/liteforum.db"
   [[ -f "$DB" ]] && { warn "DB exists, leaving untouched."; return; }
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 CLI missing — aborting DB init"
   log "Initializing SQLite (WAL, busy_timeout, FTS5, notifications)..."
   sqlite3 "$DB" <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -212,7 +236,7 @@ write_env() {
 <?php
 return [
     'app_name'          => 'LiteForum',
-    'default_lang'      => '$LANG_CODE',   // LOCKED AT INSTALL. 'tr' → ErenDev OAuth rendered; 'en' → NEVER rendered.
+    'default_lang'      => '$LANG_CODE',   // LOCKED AT INSTALL. 'tr' → ErenDev OAuth credentials exist.
     'available_langs'   => ['tr','en','fr','de','es','ar'],
     'app_key'           => '$APP_KEY',
     'db_path'           => '$DATA_DIR/liteforum.db',
@@ -528,7 +552,6 @@ declare(strict_types=1);
 function search_posts(PDO $db, string $q, ?int $categoryId=null, ?int $authorId=null, int $page=1, int $per=20): array {
   $q = trim($q);
   if ($q === '') return ['rows'=>[], 'total'=>0];
-  // FTS5 bm25 ranking; snippet highlighting
   $sql = 'SELECT p.id, p.topic_id, p.user_id, p.created_at,
                  snippet(posts_fts, 0, \'<mark>\', \'</mark>\', \'…\', 20) AS snippet,
                  bm25(posts_fts) AS rank,
@@ -546,7 +569,6 @@ function search_posts(PDO $db, string $q, ?int $categoryId=null, ?int $authorId=
   $st = $db->prepare($sql);
   try { $st->execute($params); } catch (PDOException $e) { return ['rows'=>[], 'total'=>0]; }
   $rows = $st->fetchAll();
-  // total via count query
   $csql = 'SELECT COUNT(*) FROM posts_fts JOIN posts p ON p.id=posts_fts.rowid JOIN topics t ON t.id=p.topic_id WHERE posts_fts MATCH ?';
   $cparams = [$q];
   if ($categoryId) { $csql .= ' AND t.category_id = ?'; $cparams[] = $categoryId; }
@@ -587,8 +609,6 @@ write_views() {
   code{background:var(--bg);padding:1px 6px;border-radius:4px;color:var(--accent-400);font-size:.9em}
   .badge-notif{display:inline-block;background:#ef4444;color:#fff;border-radius:999px;font-size:11px;padding:1px 6px;margin-left:4px}
   mark{background:var(--accent-500);color:#fff;padding:0 2px;border-radius:2px}
-  .flash{padding:.75rem 1rem;border-radius:.5rem;margin-bottom:1rem;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);color:#34d399}
-  .flash-err{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);color:#fca5a5}
 </style>
 </head>
 <body class="bg-pattern" style="position:relative;min-height:100vh">
@@ -648,9 +668,13 @@ PHP
     <button type="submit"><?= e(t('login')) ?></button>
   </form>
   <?php
-  /* ErenDev OAuth — RENDERED ONLY WHEN INSTALL LANG IS 'tr'.
-     Bound to config['default_lang'], NOT $_SESSION['ui_lang']. */
-  if (($config['default_lang'] ?? '') === 'tr'):
+  /* ErenDev OAuth — DOUBLE GATE:
+       1. Install language MUST be 'tr' (OAuth credentials exist in config)
+       2. Current UI language MUST be 'tr'
+     Any other combination → <img> is never written to the response. */
+  $showErenDev = (($config['default_lang'] ?? '') === 'tr')
+              && (($_SESSION['ui_lang'] ?? '') === 'tr');
+  if ($showErenDev):
     $state = bin2hex(random_bytes(24));
     $_SESSION['erendev_state'] = $state;
     $url = $config['erendev']['authorize_url']
@@ -683,7 +707,8 @@ PHP
     <input name="hp" type="text" tabindex="-1" autocomplete="off" style="display:none" aria-hidden="true">
     <button type="submit"><?= e(t('register')) ?></button>
   </form>
-  <?php if (($config['default_lang'] ?? '') === 'tr'): ?>
+  <?php $showErenDev = (($config['default_lang'] ?? '') === 'tr') && (($_SESSION['ui_lang'] ?? '') === 'tr');
+  if ($showErenDev): ?>
     <div style="margin-top:1.25rem;padding-top:1.25rem;border-top:1px solid var(--border)">
       <a href="/login.php"><img src="<?= e($config['erendev']['button_svg']) ?>" alt="ErenDev ile Giriş Yap" style="height:48px"></a>
     </div>
@@ -714,7 +739,7 @@ PHP
       <div style="padding:1rem 0;border-bottom:1px solid var(--border)">
         <a href="/topic.php?id=<?= (int)$r['topic_id'] ?>" style="font-weight:600"><?= e($r['topic_title']) ?></a>
         <span class="muted" style="font-size:12px"> · @<?= e($r['username']) ?></span>
-        <p style="margin:.5rem 0 0"><?= $r['snippet'] /* already HTML-escaped by FTS5 with <mark> tags */ ?></p>
+        <p style="margin:.5rem 0 0"><?= $r['snippet'] ?></p>
       </div>
     <?php endforeach; ?>
   <?php endif; ?>
@@ -1014,7 +1039,9 @@ declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
 $config = require LF_ROOT.'/config/config.php';
 
+// Double gate: install must be TR AND current UI must be TR
 if (($config['default_lang'] ?? '') !== 'tr') { http_response_code(404); exit('Not found.'); }
+if (($_SESSION['ui_lang'] ?? '') !== 'tr')     { http_response_code(404); exit('Not found.'); }
 
 $state=(string)($_GET['state']??''); $code=(string)($_GET['code']??'');
 if (!$state||!hash_equals($_SESSION['erendev_state']??'',$state)) { http_response_code(400); exit('Invalid state.'); }
@@ -1063,6 +1090,9 @@ PHP
 }
 
 write_nginx() {
+  # Ensure the sites-available/sites-enabled convention dirs exist (Debian-only layout)
+  install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
+
   SOCK="/run/php/${PHP_VER}-fpm-liteforum.sock"
   cat > "/etc/nginx/sites-available/liteforum" <<NGINX
 limit_req_zone \$binary_remote_addr zone=lf_login:10m rate=10r/m;
@@ -1136,6 +1166,7 @@ NGINX
 
 write_phpfpm() {
   POOL="/etc/php/${PHP_VER#php}/fpm/pool.d/liteforum.conf"
+  install -d -o root -g root -m 0755 "$(dirname "$POOL")"
   cat > "$POOL" <<FPM
 [liteforum]
 user = $SVC_USER
@@ -1188,6 +1219,7 @@ setup_ufw() {
 }
 
 setup_fail2ban() {
+  install -d -o root -g root -m 0755 /etc/fail2ban/jail.d /etc/fail2ban/filter.d
   cat > /etc/fail2ban/jail.d/liteforum.local <<'F2B'
 [sshd]
 enabled = true
@@ -1218,6 +1250,7 @@ FLT
 }
 
 setup_sysctl() {
+  install -d -o root -g root -m 0755 /etc/sysctl.d
   cat > /etc/sysctl.d/99-liteforum.conf <<'SYS'
 kernel.dmesg_restrict = 1
 kernel.kptr_restrict = 2
@@ -1244,6 +1277,7 @@ SYS
 }
 
 setup_backup() {
+  install -d -o root -g root -m 0755 /etc/cron.d
   cat > /etc/cron.d/liteforum-backup <<CRON
 30 3 * * * $SVC_USER sqlite3 $DATA_DIR/liteforum.db "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1
 45 3 * * * root tar czf - $DATA_DIR | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:/etc/liteforum/backup.pass > $DATA_DIR/backups/lf-\$(date +\\%F).tar.gz.enc 2>/dev/null && find $DATA_DIR/backups -name 'lf-*.tar.gz.enc' -mtime +14 -delete
@@ -1256,6 +1290,7 @@ CRON
 
 setup_tls() {
   [[ $SKIP_TLS -eq 1 ]] && { warn "TLS skipped"; return; }
+  install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
   cat > /etc/nginx/sites-available/liteforum.http <<HTTP
 server { listen 80; server_name $DOMAIN; root $APP_DIR/public;
   location /.well-known/acme-challenge/ { allow all; }
@@ -1300,7 +1335,7 @@ start_services() {
 [[ $DRY_RUN -eq 1 ]] && { cat <<EOF
 DRY-RUN plan:
   Domain : $DOMAIN
-  Lang   : $LANG_CODE  (ErenDev OAuth rendered: $([[ $LANG_CODE == tr ]] && echo YES || echo NO))
+  Lang   : $LANG_CODE  (ErenDev button: install=tr AND ui=tr)
   Admin  : $ADMIN_EMAIL
   AppDir : $APP_DIR
   DataDir: $DATA_DIR
@@ -1308,6 +1343,7 @@ DRY-RUN plan:
 EOF
 exit 0; }
 
+preflight
 detect_os; install_packages; create_user; create_dirs; gen_secrets; init_sqlite
 write_env; write_i18n; write_app; write_views; write_public
 write_nginx; write_phpfpm; setup_ufw; setup_fail2ban; setup_sysctl
@@ -1319,7 +1355,7 @@ LiteForum — Installation Summary ($(date -Is))
 ===============================================
 URL              : https://$DOMAIN
 Install language : $LANG_CODE
-ErenDev OAuth    : $([[ $LANG_CODE == tr ]] && echo "VISIBLE (login + register)" || echo "HIDDEN (never rendered)")
+ErenDev OAuth    : $([[ $LANG_CODE == tr ]] && echo "VISIBLE only when UI language is Turkish" || echo "HIDDEN (no credentials — install was $LANG_CODE)")
 UI languages     : tr, en, fr, de, es, ar (switcher in header)
 Themes           : dark, light, high-contrast
 Accents          : indigo, emerald, rose, amber, sky
@@ -1344,9 +1380,9 @@ echo "============================================================"
 echo " LiteForum is ready → https://$DOMAIN"
 echo " Install language: $LANG_CODE"
 if [[ "$LANG_CODE" == "tr" ]]; then
-  echo " ErenDev OAuth: VISIBLE (button shown on login + register)"
+  echo " ErenDev OAuth: VISIBLE only when UI language is Turkish"
 else
-  echo " ErenDev OAuth: HIDDEN (EN install — button is never rendered anywhere)"
+  echo " ErenDev OAuth: HIDDEN (no credentials — install was $LANG_CODE)"
 fi
 echo " Admin login: $ADMIN_EMAIL"
 echo " Admin pass : $ADMIN_PASS   → $CRED_FILE"
