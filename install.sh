@@ -8,7 +8,7 @@ set -Eeuo pipefail
 umask 027
 
 DOMAIN=""; ADMIN_EMAIL=""; EMAIL=""
-LANG_CODE="tr"                 # tr | en — ErenDev button is rendered ONLY when install=tr AND ui=tr
+LANG_CODE="tr"
 DRY_RUN=0; SKIP_TLS=0; NO_FIREWALL=0
 APP_DIR="/var/www/liteforum"; DATA_DIR="/var/lib/liteforum"; LOG_DIR="/var/log/liteforum"
 SVC_USER="liteforum"; PHP_VER=""; INSTALL_LOG="/var/log/liteforum-install.log"
@@ -20,10 +20,10 @@ die()  { printf "\e[31m[FATAL]\e[0m %s\n" "$*" | tee -a "$INSTALL_LOG"; exit 1; 
 
 usage() { cat <<EOT
 LiteForum Installer (English)
-  --domain <fqdn>       Domain (Let's Encrypt TLS is provisioned automatically)
+  --domain <fqdn>       Domain (Let's Encrypt TLS is provisioned if ports 80/443 are open)
   --email <mail>        Contact email for Let's Encrypt + admin
   --admin <mail>        Admin email (password is auto-generated)
-  --lang <tr|en>        Install language — 'tr' shows ErenDev OAuth (UI must also be tr)
+  --lang <tr|en>        Install language — 'tr' enables ErenDev OAuth credentials
   --skip-tls            Skip TLS (HTTP only, HSTS disabled)
   --no-firewall         Skip UFW setup
   --dry-run             Print plan only
@@ -46,9 +46,6 @@ ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${DOMAIN}}"; EMAIL="${EMAIL:-$ADMIN_EMAIL}"
 
 log "LiteForum installer starting — domain=$DOMAIN lang=$LANG_CODE admin=$ADMIN_EMAIL dry-run=$DRY_RUN"
 
-# ---------------------------------------------------------------------------
-# Pre-flight: ensure the sqlite3 CLI exists before we get deep into the script
-# ---------------------------------------------------------------------------
 preflight() {
   if ! command -v sqlite3 >/dev/null 2>&1; then
     log "sqlite3 CLI not found — installing it now..."
@@ -71,7 +68,6 @@ detect_os() {
 install_packages() {
   log "Installing packages (apt)..."
   export DEBIAN_FRONTEND=noninteractive
-
   apt-get update -y -qq || die "apt-get update failed"
   apt-get upgrade -y -qq || warn "apt-get upgrade had issues (continuing)"
 
@@ -79,7 +75,6 @@ install_packages() {
   [[ -n "$PHP_VER" ]] || PHP_VER="php8.2"
   log "PHP version: $PHP_VER"
 
-  # Core packages — NO error swallowing. If this fails, the script dies with the real message.
   if ! apt-get install -y -qq \
       nginx nginx-common \
       "$PHP_VER-fpm" "$PHP_VER-cli" "$PHP_VER-sqlite3" "$PHP_VER-curl" \
@@ -92,17 +87,15 @@ install_packages() {
     die "Core package installation failed — see output above"
   fi
 
-  # Optional Nginx helper modules (failure tolerated)
   apt-get install -y -qq libnginx-mod-http-headers-more-filter libnginx-mod-http-limit-req \
     2>>"$INSTALL_LOG" || warn "Optional nginx modules not installed (non-fatal)"
 
-  # Post-install sanity checks
-  command -v nginx        >/dev/null 2>&1 || die "nginx binary missing after install"
-  [[ -f /etc/nginx/nginx.conf ]]            || die "/etc/nginx/nginx.conf missing after install"
-  [[ -d /etc/nginx/sites-available ]]       || die "/etc/nginx/sites-available missing after install"
-  command -v sqlite3      >/dev/null 2>&1 || die "sqlite3 CLI missing after install"
-  command -v php          >/dev/null 2>&1 || die "php CLI missing after install"
+  command -v nginx   >/dev/null 2>&1 || die "nginx binary missing after install"
+  [[ -f /etc/nginx/nginx.conf ]]      || die "/etc/nginx/nginx.conf missing after install"
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 CLI missing after install"
+  command -v php     >/dev/null 2>&1 || die "php CLI missing after install"
 
+  install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
   ok "Packages installed (nginx + sqlite3 + php verified)"
 }
 
@@ -248,7 +241,7 @@ write_env() {
 <?php
 return [
     'app_name'          => 'LiteForum',
-    'default_lang'      => '$LANG_CODE',   // LOCKED AT INSTALL. 'tr' → ErenDev OAuth credentials exist.
+    'default_lang'      => '$LANG_CODE',
     'available_langs'   => ['tr','en','fr','de','es','ar'],
     'app_key'           => '$APP_KEY',
     'db_path'           => '$DATA_DIR/liteforum.db',
@@ -412,6 +405,8 @@ if (!isset($_SESSION['ui_lang']) || !in_array($_SESSION['ui_lang'], $config['ava
 i18n_init($_SESSION['ui_lang']);
 csrf_init($config['app_key']);
 $db = db_init($config['db_path']);
+$GLOBALS['__config'] = $config;
+$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 PHP
 
   cat > "$APP_DIR/app/db.php" <<'PHP'
@@ -668,6 +663,64 @@ PHP
 </div>
 PHP
 
+  cat > "$APP_DIR/views/category.php" <<'PHP'
+<?php /* @var array $cat @var array $topics */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
+<div class="glass card">
+  <h1 style="margin:0 0 1rem;color:var(--fg)"><?= e($cat['name_'.$lc] ?? $cat['name_en']) ?></h1>
+  <?php if (empty($topics)): ?>
+    <p class="muted">Henüz konu yok.</p>
+  <?php else: ?>
+    <table>
+      <thead><tr><th>Konu</th><th>Yazar</th><th>Mesaj</th><th>Tarih</th></tr></thead>
+      <tbody>
+      <?php foreach ($topics as $t): ?>
+        <tr>
+          <td><?php if ((int)$t['is_pinned']): ?>📌 <?php endif; ?><a href="/topic.php?id=<?= (int)$t['id'] ?>"><?= e($t['title']) ?></a></td>
+          <td class="muted">@<?= e($t['username']) ?></td>
+          <td class="muted"><?= (int)$t['post_count'] ?></td>
+          <td class="muted"><?= date('Y-m-d', (int)$t['updated_at']) ?></td>
+        </tr>
+      <?php endforeach; ?>
+      </tbody>
+    </table>
+  <?php endif; ?>
+</div>
+PHP
+
+  cat > "$APP_DIR/views/topic.php" <<'PHP'
+<?php /* @var array $topic @var array $posts @var bool $watching */ ?>
+<div class="glass card" style="margin-bottom:1rem">
+  <h1 style="margin:0 0 .5rem;color:var(--fg)"><?= e($topic['title']) ?></h1>
+  <p class="muted" style="margin:0;font-size:13px">
+    @<?= e($topic['username']) ?> · <?= date('Y-m-d H:i', (int)$topic['created_at']) ?>
+  </p>
+  <?php if (auth_user()): ?>
+    <form method="post" action="/topic.php?id=<?= (int)$topic['id'] ?>" style="margin-top:.75rem">
+      <?= csrf_field() ?><input type="hidden" name="action" value="toggle_watch">
+      <button class="btn-ghost" type="submit"><?= e($watching ? t('unwatch_topic') : t('watch_topic')) ?></button>
+    </form>
+  <?php endif; ?>
+</div>
+
+<?php foreach ($posts as $p): ?>
+  <div class="glass card" style="margin-bottom:.75rem">
+    <p class="muted" style="margin:0 0 .5rem;font-size:12px">@<?= e($p['username']) ?> · <?= date('Y-m-d H:i', (int)$p['created_at']) ?></p>
+    <div style="white-space:pre-wrap"><?= e($p['body']) ?></div>
+  </div>
+<?php endforeach; ?>
+
+<?php if (auth_user() && empty($topic['is_locked'])): ?>
+<div class="glass card">
+  <h2 style="margin:0 0 .75rem;color:var(--fg)"><?= e(t('reply')) ?></h2>
+  <form method="post" action="/topic.php?id=<?= (int)$topic['id'] ?>" class="grid">
+    <?= csrf_field() ?><input type="hidden" name="action" value="reply">
+    <textarea name="body" rows="5" required></textarea>
+    <button type="submit"><?= e(t('submit')) ?></button>
+  </form>
+</div>
+<?php endif; ?>
+PHP
+
   cat > "$APP_DIR/views/login.php" <<'PHP'
 <?php /* @var string $error */ $config = $GLOBALS['__config']; ?>
 <div class="glass card" style="max-width:420px;margin:2rem auto">
@@ -680,10 +733,6 @@ PHP
     <button type="submit"><?= e(t('login')) ?></button>
   </form>
   <?php
-  /* ErenDev OAuth — DOUBLE GATE:
-       1. Install language MUST be 'tr' (OAuth credentials exist in config)
-       2. Current UI language MUST be 'tr'
-     Any other combination → <img> is never written to the response. */
   $showErenDev = (($config['default_lang'] ?? '') === 'tr')
               && (($_SESSION['ui_lang'] ?? '') === 'tr');
   if ($showErenDev):
@@ -852,8 +901,6 @@ write_public() {
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$GLOBALS['__config'] = $config;
-$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $cats = $db->query("SELECT c.*, (SELECT COUNT(*) FROM topics t WHERE t.category_id=c.id) AS n FROM categories c ORDER BY position, id")->fetchAll();
 $title = t('forum');
 ob_start(); require LF_ROOT.'/views/home.php'; $content = ob_get_clean();
@@ -875,8 +922,6 @@ PHP
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$GLOBALS['__config'] = $config;
-$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $error='';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
@@ -901,8 +946,6 @@ PHP
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$GLOBALS['__config'] = $config;
-$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $error='';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
@@ -938,12 +981,85 @@ if ($_SERVER['REQUEST_METHOD']!=='POST') { http_response_code(405); exit; }
 csrf_verify(); auth_logout(); redirect('/');
 PHP
 
+  cat > "$APP_DIR/public/category.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+$slug = trim((string)($_GET['slug'] ?? ''));
+if ($slug === '') { http_response_code(400); exit('Missing category slug.'); }
+$st = $db->prepare('SELECT * FROM categories WHERE slug = ?'); $st->execute([$slug]); $cat = $st->fetch();
+if (!$cat) { http_response_code(404); exit('Category not found.'); }
+
+$page = max(1, (int)($_GET['page'] ?? 1));
+$per = 25; $off = ($page - 1) * $per;
+$tst = $db->prepare(
+  'SELECT t.*, u.username, (SELECT COUNT(*) FROM posts p WHERE p.topic_id = t.id) AS post_count
+   FROM topics t JOIN users u ON u.id = t.user_id
+   WHERE t.category_id = ?
+   ORDER BY t.is_pinned DESC, t.updated_at DESC
+   LIMIT ? OFFSET ?'
+);
+$tst->execute([(int)$cat['id'], $per, $off]);
+$topics = $tst->fetchAll();
+$title = $cat['name_'.($_SESSION['ui_lang'] ?? 'tr')] ?? $cat['name_en'];
+ob_start(); require LF_ROOT.'/views/category.php'; $content = ob_get_clean();
+require LF_ROOT.'/views/layout.php';
+PHP
+
+  cat > "$APP_DIR/public/topic.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+$id = (int)($_GET['id'] ?? 0);
+if ($id <= 0) { http_response_code(400); exit('Missing topic id.'); }
+
+$tst = $db->prepare('SELECT t.*, u.username FROM topics t JOIN users u ON u.id=t.user_id WHERE t.id=?');
+$tst->execute([$id]); $topic = $tst->fetch();
+if (!$topic) { http_response_code(404); exit('Topic not found.'); }
+
+$u = auth_user();
+if ($_SERVER['REQUEST_METHOD']==='POST' && $u) {
+  csrf_verify();
+  $action = $_POST['action'] ?? '';
+  if ($action === 'toggle_watch') {
+    $w = $db->prepare('SELECT 1 FROM topic_watches WHERE user_id=? AND topic_id=?');
+    $w->execute([(int)$u['id'], $id]);
+    if ($w->fetchColumn()) {
+      $db->prepare('DELETE FROM topic_watches WHERE user_id=? AND topic_id=?')->execute([(int)$u['id'], $id]);
+    } else {
+      $db->prepare('INSERT INTO topic_watches(user_id,topic_id,created_at) VALUES(?,?,?)')->execute([(int)$u['id'], $id, time()]);
+    }
+  } elseif ($action === 'reply' && empty($topic['is_locked'])) {
+    $body = trim((string)($_POST['body'] ?? ''));
+    if ($body !== '' && rate_limit($db,'post',client_ip(),$config['rate_limit']['post_per_min'],60)) {
+      $db->prepare('INSERT INTO posts(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)')
+         ->execute([$id, (int)$u['id'], $body, time(), time()]);
+      $newPostId = (int)$db->lastInsertId();
+      $db->prepare('UPDATE topics SET updated_at=? WHERE id=?')->execute([time(), $id]);
+      notif_for_mentions($db, $body, $id, $newPostId, (int)$u['id']);
+      notif_for_replies($db, $id, $newPostId, (int)$u['id'], $body);
+    }
+  }
+  redirect('/topic.php?id='.$id);
+}
+
+$pst = $db->prepare('SELECT p.*, u.username FROM posts p JOIN users u ON u.id=p.user_id WHERE p.topic_id=? ORDER BY p.created_at ASC');
+$pst->execute([$id]); $posts = $pst->fetchAll();
+
+$watching = false;
+if ($u) {
+  $w = $db->prepare('SELECT 1 FROM topic_watches WHERE user_id=? AND topic_id=?');
+  $w->execute([(int)$u['id'], $id]); $watching = (bool)$w->fetchColumn();
+}
+$title = $topic['title'];
+ob_start(); require LF_ROOT.'/views/topic.php'; $content = ob_get_clean();
+require LF_ROOT.'/views/layout.php';
+PHP
+
   cat > "$APP_DIR/public/search.php" <<'PHP'
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$GLOBALS['__config'] = $config;
-$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $q = trim((string)($_GET['q'] ?? ''));
 $catId = isset($_GET['cat']) && $_GET['cat'] !== '' ? (int)$_GET['cat'] : null;
 $author = trim((string)($_GET['author'] ?? ''));
@@ -964,8 +1080,6 @@ PHP
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$GLOBALS['__config'] = $config;
-$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $u = auth_require();
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
@@ -982,11 +1096,8 @@ PHP
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$GLOBALS['__config'] = $config;
-$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $u = auth_require();
-$row = $db->prepare('SELECT * FROM users WHERE id=?'); $row->execute([(int)$u['id']]);
-$user = $row->fetch();
+$row = $db->prepare('SELECT * FROM users WHERE id=?'); $row->execute([(int)$u['id']]); $user = $row->fetch();
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
   $theme = in_array($_POST['theme']??'', $config['themes'], true) ? $_POST['theme'] : 'dark';
@@ -1008,8 +1119,6 @@ PHP
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$GLOBALS['__config'] = $config;
-$GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $u = auth_admin();
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
@@ -1049,9 +1158,6 @@ PHP
 <?php
 declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
-$config = require LF_ROOT.'/config/config.php';
-
-// Double gate: install must be TR AND current UI must be TR
 if (($config['default_lang'] ?? '') !== 'tr') { http_response_code(404); exit('Not found.'); }
 if (($_SESSION['ui_lang'] ?? '') !== 'tr')     { http_response_code(404); exit('Not found.'); }
 
@@ -1102,9 +1208,7 @@ PHP
 }
 
 write_nginx() {
-  # Ensure the sites-available/sites-enabled convention dirs exist (Debian-only layout)
   install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
-
   SOCK="/run/php/${PHP_VER}-fpm-liteforum.sock"
   cat > "/etc/nginx/sites-available/liteforum" <<NGINX
 limit_req_zone \$binary_remote_addr zone=lf_login:10m rate=10r/m;
@@ -1168,6 +1272,7 @@ NGINX
     sed -i 's/return 301 https:\/\/\$host\$request_uri;//' /etc/nginx/sites-available/liteforum
     sed -i 's/listen 443 ssl http2;/listen 80;/' /etc/nginx/sites-available/liteforum
     sed -i '/ssl_/d;/Strict-Transport-Security/d' /etc/nginx/sites-available/liteforum
+    sed -i 's#ssl_certificate.*##;s#ssl_certificate_key.*##' /etc/nginx/sites-available/liteforum
   }
   ln -sf /etc/nginx/sites-available/liteforum /etc/nginx/sites-enabled/liteforum
   rm -f /etc/nginx/sites-enabled/default
@@ -1311,12 +1416,23 @@ HTTP
   ln -sf /etc/nginx/sites-available/liteforum.http /etc/nginx/sites-enabled/liteforum.http
   rm -f /etc/nginx/sites-enabled/liteforum
   nginx -t && systemctl reload nginx
-  certbot --nginx -d "$DOMAIN" -m "$EMAIL" --agree-tos --non-interactive --redirect || die "Certbot failed"
+  if certbot --nginx -d "$DOMAIN" -m "$EMAIL" --agree-tos --non-interactive --redirect; then
+    ok "TLS certificate issued"
+  else
+    warn "Certbot failed — the forum will run on HTTP for now."
+    warn "Fix firewall/security-list on your host and re-run:"
+    warn "  sudo certbot --nginx -d $DOMAIN -m $EMAIL --agree-tos --non-interactive --redirect"
+    [[ -f /etc/nginx/sites-available/liteforum ]] || write_nginx
+    rm -f /etc/nginx/sites-enabled/liteforum.http
+    ln -sf /etc/nginx/sites-available/liteforum /etc/nginx/sites-enabled/liteforum
+    sed -i 's/listen 443 ssl http2;/listen 80;/;s/listen \[::\]:443 ssl http2;//;s#ssl_certificate.*##;s#ssl_certificate_key.*##;s#ssl_trusted_certificate.*##;s#return 301 https://\$host\$request_uri;##;s#Strict-Transport-Security.*##' /etc/nginx/sites-available/liteforum
+    nginx -t && systemctl reload nginx
+    return 0
+  fi
   rm -f /etc/nginx/sites-enabled/liteforum.http
   ln -sf /etc/nginx/sites-available/liteforum /etc/nginx/sites-enabled/liteforum
   nginx -t && systemctl reload nginx
   systemctl enable --now certbot.timer 2>/dev/null || true
-  ok "TLS done"
 }
 
 seed_data() {
@@ -1356,10 +1472,26 @@ EOF
 exit 0; }
 
 preflight
-detect_os; install_packages; create_user; create_dirs; gen_secrets; init_sqlite
-write_env; write_i18n; write_app; write_views; write_public
-write_nginx; write_phpfpm; setup_ufw; setup_fail2ban; setup_sysctl
-setup_backup; seed_data; setup_tls; start_services
+detect_os
+install_packages
+create_user
+create_dirs
+gen_secrets
+init_sqlite
+write_env
+write_i18n
+write_app
+write_views
+write_public
+write_nginx
+write_phpfpm
+setup_ufw
+setup_fail2ban
+setup_sysctl
+setup_backup
+seed_data
+setup_tls
+start_services
 
 CRED_FILE="/root/liteforum-credentials.txt"
 cat > "$CRED_FILE" <<EOF
