@@ -1,4 +1,3 @@
-```markdown
 # LiteForum
 
 A lightweight, modern, open-source forum — vanilla PHP + SQLite (WAL) + Nginx + PHP-FPM.
@@ -27,6 +26,7 @@ It is not a clone of Flarum or phpBB. It is a small, auditable forum that you ca
 - **Vanilla PHP 8.2.** No framework, no `vendor/` folder. Every file is readable top-to-bottom.
 - **SQLite with WAL.** `journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`, `foreign_keys=ON`. Concurrent reads alongside a single writer.
 - **One-command install.** `curl | bash` provisions Nginx, PHP-FPM, TLS, UFW, Fail2ban, cron backups, and kernel hardening. No Docker, no Kubernetes, no YAML.
+- **No domain? No problem.** `--cloudflared` exposes the forum through a Cloudflare tunnel, with no domain and no open inbound ports required.
 - **Six languages out of the box.** Turkish, English, French, German, Spanish, Arabic (RTL). A dropdown in the header switches the UI instantly. Adding a seventh language is a 40-line file.
 - **ErenDev OAuth, scoped to Turkish.** The button appears only when both the install language and the current UI language are Turkish. In every other combination it is not written to the served HTML at all.
 - **Sane security defaults.** CSRF on every form, Argon2id passwords, secure session cookies, CSP, HSTS, rate limits, audit log — all pre-wired.
@@ -188,14 +188,16 @@ Full OAuth2 + PKCE + OIDC docs: [oauth2.erendev.xyz/developer/docs](https://oaut
 ### Requirements
 
 - Ubuntu 22.04 / 24.04 or Debian 12 (x86_64 or arm64)
-- A domain pointing at the server's public IP
+- **Either** a domain pointing at the server's public IP, **or** no domain at all if you use `--cloudflared`
 - 512 MB RAM minimum, 1 GB recommended
 - Root access
-- **Ports 80 and 443 open** — in your provider's firewall *and* in the OS (`ufw`, `iptables`). Oracle Cloud, AWS Lightsail, and similar providers have a separate cloud-side firewall that must be configured too, or Let's Encrypt validation will fail.
+- **Ports 80 and 443 open** (domain mode only) — in your provider's firewall *and* in the OS (`ufw`, `iptables`). Oracle Cloud, AWS Lightsail, and similar providers have a separate cloud-side firewall that must be configured too, or Let's Encrypt validation will fail. Not needed with `--cloudflared`, since the tunnel only makes outbound connections.
 
 ### Three steps
 
-**1. Install (Turkish forum — ErenDev button available):**
+**1. Install.** Pick one of the three modes below.
+
+Turkish forum with a domain (ErenDev button available):
 
 ```bash
 curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
@@ -205,12 +207,21 @@ curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
   --lang   tr
 ```
 
-**Or install (English forum — ErenDev button never rendered):**
+English forum with a domain (ErenDev button never rendered):
 
 ```bash
 curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
   --domain forum.example.com \
   --email  you@example.com \
+  --admin  admin@example.com \
+  --lang   en
+```
+
+No domain, Cloudflare tunnel (HTTP is served through `trycloudflare.com`):
+
+```bash
+curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
+  --cloudflared \
   --admin  admin@example.com \
   --lang   en
 ```
@@ -221,13 +232,15 @@ curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
 sudo cat /root/liteforum-credentials.txt
 ```
 
-**3. Open the site:**
+**3. Open the site.** With a domain:
 
 ```
 https://forum.example.com
 ```
 
-TLS is provisioned by Let's Encrypt. The certificate renews automatically via `certbot.timer`.
+With `--cloudflared`, the public URL is printed at the end of the install and is also written to the credentials file under `URL`.
+
+TLS is provisioned by Let's Encrypt in domain mode. The certificate renews automatically via `certbot.timer`.
 
 If Let's Encrypt fails (closed port, DNS issue, rate limit), the installer continues with HTTP-only and prints a message telling you to re-run `certbot` later. The forum still works.
 
@@ -235,13 +248,32 @@ If Let's Encrypt fails (closed port, DNS issue, rate limit), the installer conti
 
 | Flag | Default | Description |
 |---|---|---|
-| `--domain <fqdn>` | *required* | Domain for the site and TLS certificate |
+| `--domain <fqdn>` | *required* unless `--cloudflared` | Domain for the site and TLS certificate |
+| `--cloudflared` | off | Expose the forum through a Cloudflare quick tunnel. Cannot be combined with `--domain` |
 | `--email <mail>` | `admin@<domain>` | Let's Encrypt contact + admin email |
 | `--admin <mail>` | `admin@<domain>` | Admin account email |
 | `--lang <tr\|en>` | `tr` | Install language — controls whether ErenDev OAuth credentials exist |
 | `--skip-tls` | off | HTTP only; HSTS disabled |
 | `--no-firewall` | off | Skip UFW setup |
 | `--dry-run` | off | Print plan, make no changes |
+
+When `--cloudflared` is used without `--domain`, the admin email defaults to `admin@localhost`, so pass `--admin` if you want a real address.
+
+### Cloudflare tunnel mode
+
+`--cloudflared` is for servers without a domain, behind NAT, or where you don't want to open ports 80 and 443. The installer:
+
+- installs `cloudflared` from the official GitHub release,
+- creates and starts a systemd service, `liteforum-cloudflared`, that runs `cloudflared tunnel --url http://127.0.0.1:80`,
+- reads the generated `https://<random>.trycloudflare.com` address from the service log,
+- writes that address into `config.php` as `base_url` and the OAuth `redirect_uri`.
+
+Things to know:
+
+- **The URL changes whenever the tunnel restarts.** Quick tunnels are temporary. For a stable address, you need a named tunnel tied to a domain in your Cloudflare account. That is not handled by this installer yet.
+- **TLS is terminated by Cloudflare,** so the origin serves HTTP only. Visitors still get HTTPS.
+- **ErenDev OAuth is unreliable in this mode.** The provider has to accept the redirect URI, and the address changes. Expect the Turkish login button to fail after a restart.
+- Check the current address with `sudo journalctl -u liteforum-cloudflared | grep trycloudflare`.
 
 ### What the installer touches
 
@@ -255,6 +287,8 @@ If Let's Encrypt fails (closed port, DNS issue, rate limit), the installer conti
 /etc/sysctl.d/99-liteforum.conf
 /etc/cron.d/liteforum-backup
 /etc/liteforum/backup.pass       # 0600 backup encryption key
+/etc/systemd/system/liteforum-cloudflared.service   # only with --cloudflared
+/usr/bin/cloudflared                                # only with --cloudflared
 /root/liteforum-credentials.txt  # 0600 admin + OAuth creds
 ```
 
@@ -293,6 +327,8 @@ sudo systemctl reload php*-fpm nginx
 
 ```bash
 sudo systemctl disable --now nginx php*-fpm fail2ban
+sudo systemctl disable --now liteforum-cloudflared 2>/dev/null
+sudo rm -f /etc/systemd/system/liteforum-cloudflared.service
 sudo rm -f /etc/nginx/sites-enabled/liteforum /etc/nginx/sites-available/liteforum
 sudo rm -rf /var/www/liteforum /var/lib/liteforum /var/log/liteforum /etc/liteforum
 sudo rm -f /root/liteforum-credentials.txt
@@ -314,7 +350,7 @@ sudo userdel liteforum 2>/dev/null
 | Sessions | PHP native, file-backed, `SameSite=Strict` | Secure by default |
 | Passwords | **Argon2id** via `password_hash` | Modern KDF |
 | OAuth | **OAuth2 Authorization Code** (ErenDev IdP) | Optional, Turkish UI only |
-| TLS | **Let's Encrypt** via Certbot | Free, automatic |
+| TLS | **Let's Encrypt** via Certbot, or **Cloudflare** tunnel termination | Free, automatic |
 | Firewall | **UFW** + **Fail2ban** | Belt and suspenders |
 | Backups | `sqlite3 checkpoint` + `tar` + `openssl enc` | Portable, encrypted |
 
@@ -381,6 +417,9 @@ cd liteforum
 # Dry-run to see the plan (no changes)
 sudo bash install.sh --dry-run --domain localhost --lang tr
 
+# Dry-run of the tunnel variant
+sudo bash install.sh --dry-run --cloudflared --lang tr
+
 # Or run locally without install
 php -S 127.0.0.1:8080 -t public
 ```
@@ -414,6 +453,7 @@ Open an issue with:
 - PHP version (`php -v`)
 - Install command used
 - Output of `sudo journalctl -u php*-fpm -u nginx --since "10 min ago"`
+- For tunnel installs, output of `sudo journalctl -u liteforum-cloudflared --since "10 min ago"`
 
 For security issues, email `security@liteforum.dev` instead of opening a public issue. We aim to respond within 72 hours.
 
@@ -438,6 +478,9 @@ No. The button is rendered only when **both** the install language is Turkish **
 
 **What happens if someone hits `/oauth/erendev/callback.php` while on a non-Turkish UI?**
 The callback returns `404 Not Found`. The endpoint is guarded by the same double check as the button.
+
+**Do I need a domain?**
+No, if you use `--cloudflared`. You get a temporary `trycloudflare.com` address that changes on restart. For a permanent address, use a domain with `--domain`.
 
 **How do I change the site name?**
 Log in as admin, go to `/admin.php`. The "Site Settings" card at the top has name and tagline fields. Saving updates the header, page titles, and footer immediately.
@@ -480,4 +523,3 @@ SOFTWARE.
 ---
 
 **Demo:** https://demo.erendev.xyz · **Install:** https://get.erendev.xyz/install.sh · **OAuth docs:** https://oauth2.erendev.xyz
-```
