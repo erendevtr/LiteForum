@@ -8,7 +8,7 @@ umask 027
 DOMAIN=""; ADMIN_EMAIL=""; EMAIL=""
 LANG_CODE="tr"
 DRY_RUN=0; SKIP_TLS=0; NO_FIREWALL=0; CLOUDFLARED=0
-CF_TOKEN=""; CF_NAMED=0
+CF_TOKEN=""; CF_LOGIN=0; CF_NAMED=0
 APP_DIR="/var/www/liteforum"; DATA_DIR="/var/lib/liteforum"; LOG_DIR="/var/log/liteforum"
 SVC_USER="liteforum"; PHP_VER=""; INSTALL_LOG="/var/log/liteforum-install.log"
 
@@ -23,6 +23,7 @@ LiteForum Installer
   --skip-tls        --no-firewall    --dry-run        -h|--help
   --cloudflared     (no --domain: expose via Cloudflare quick tunnel)
   --cf-token <tok>  (with --domain: Cloudflare named tunnel, no certbot)
+  --cf-login        (with --domain: Cloudflare login link, auto DNS + tunnel)
 EOT
 exit 0; }
 
@@ -31,16 +32,19 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --admin) ADMIN_EMAIL="$2"; shift 2;; --lang) LANG_CODE="$2"; shift 2;;
   --skip-tls) SKIP_TLS=1; shift;; --no-firewall) NO_FIREWALL=1; shift;;
   --dry-run) DRY_RUN=1; shift;; --cloudflared) CLOUDFLARED=1; shift;;
-  --cf-token) CF_TOKEN="$2"; shift 2;;
+  --cf-token) CF_TOKEN="$2"; shift 2;; --cf-login) CF_LOGIN=1; shift;;
   -h|--help) usage;;
   *) die "Unknown arg: $1";;
 esac; done
 
 [[ "$LANG_CODE" == "tr" || "$LANG_CODE" == "en" ]] || die "--lang must be tr|en"
 [[ $EUID -eq 0 ]] || die "root required"
-if [[ -n "$CF_TOKEN" ]]; then
-  [[ -n "$DOMAIN" ]] || die "--cf-token requires --domain"
-  [[ $CLOUDFLARED -eq 0 ]] || die "--cf-token cannot be combined with --cloudflared"
+if [[ -n "$CF_TOKEN" && $CF_LOGIN -eq 1 ]]; then
+  die "Use either --cf-token or --cf-login, not both"
+fi
+if [[ -n "$CF_TOKEN" || $CF_LOGIN -eq 1 ]]; then
+  [[ -n "$DOMAIN" ]] || die "--cf-token / --cf-login require --domain"
+  [[ $CLOUDFLARED -eq 0 ]] || die "Tunnel options cannot be combined with --cloudflared"
   CF_NAMED=1; SKIP_TLS=1
 elif [[ -z "$DOMAIN" ]]; then
   [[ $CLOUDFLARED -eq 1 ]] || die "--domain required (or --cloudflared, or --cf-token with --domain)"
@@ -2831,6 +2835,76 @@ UNIT
   warn "Tunnel connection not confirmed — check: journalctl -u liteforum-cloudflared -n 50"
 }
 
+setup_cf_login() {
+  [[ $CF_LOGIN -eq 1 ]] || return 0
+  install_cloudflared
+  local TUNNEL_NAME="liteforum" TUNNEL_ID="" CRED_JSON LOG
+  install -d -o root -g root -m 0700 /root/.cloudflared
+
+  if [[ ! -f /root/.cloudflared/cert.pem ]]; then
+    log "Cloudflare login: open the link below in your browser and choose the zone for $DOMAIN"
+    timeout 600 cloudflared tunnel login 2>&1 | tee -a "$INSTALL_LOG" \
+      || die "cloudflared login failed or timed out (600s)"
+    [[ -f /root/.cloudflared/cert.pem ]] || die "Login finished but cert.pem was not created"
+    ok "Cloudflare login complete"
+  else
+    ok "Existing Cloudflare login found"
+  fi
+
+  TUNNEL_ID="$(cloudflared tunnel list -o json 2>/dev/null | jq -r --arg n "$TUNNEL_NAME" '[.[] | select(.name==$n)][0].id // empty' || true)"
+  if [[ -z "$TUNNEL_ID" ]]; then
+    cloudflared tunnel create "$TUNNEL_NAME" >>"$INSTALL_LOG" 2>&1 || die "Tunnel create failed"
+    TUNNEL_ID="$(cloudflared tunnel list -o json 2>/dev/null | jq -r --arg n "$TUNNEL_NAME" '[.[] | select(.name==$n)][0].id // empty' || true)"
+  fi
+  [[ -n "$TUNNEL_ID" ]] || die "Could not determine tunnel ID for $TUNNEL_NAME"
+  ok "Tunnel $TUNNEL_NAME ($TUNNEL_ID)"
+
+  cloudflared tunnel route dns --overwrite-dns "$TUNNEL_NAME" "$DOMAIN" >>"$INSTALL_LOG" 2>&1 \
+    || die "DNS route creation failed for $DOMAIN"
+  ok "DNS $DOMAIN → tunnel"
+
+  CRED_JSON="/root/.cloudflared/${TUNNEL_ID}.json"
+  [[ -f "$CRED_JSON" ]] || die "Tunnel credentials not found: $CRED_JSON"
+  install -d -o root -g root -m 0755 /etc/cloudflared
+  install -m 0600 -o root -g root "$CRED_JSON" "/etc/cloudflared/${TUNNEL_ID}.json"
+  cat > /etc/cloudflared/config.yml <<YML
+tunnel: $TUNNEL_ID
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+ingress:
+  - hostname: $DOMAIN
+    service: http://127.0.0.1:80
+  - service: http_status:404
+YML
+
+  cat > /etc/systemd/system/liteforum-cloudflared.service <<UNIT
+[Unit]
+Description=LiteForum Cloudflare tunnel
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now liteforum-cloudflared >/dev/null 2>&1 || true
+
+  for _ in $(seq 1 30); do
+    LOG="$(journalctl -u liteforum-cloudflared --no-pager -n 200 2>/dev/null || true)"
+    if [[ "$LOG" == *"Registered tunnel connection"* ]]; then
+      ok "Cloudflare tunnel connected → https://$DOMAIN"
+      return
+    fi
+    sleep 2
+  done
+  warn "Tunnel connection not confirmed — check: journalctl -u liteforum-cloudflared -n 50"
+}
+
 [[ $DRY_RUN -eq 1 ]] && {
   cat <<EOF
 DRY-RUN:
@@ -2840,7 +2914,7 @@ DRY-RUN:
   AppDir : $APP_DIR
   DataDir: $DATA_DIR
   TLS    : $([[ $SKIP_TLS -eq 1 ]] && echo skip || echo yes)
-  Tunnel : $(if [[ $CF_NAMED -eq 1 ]]; then echo named; elif [[ $CLOUDFLARED -eq 1 ]]; then echo quick; else echo none; fi)
+  Tunnel : $(if [[ $CF_NAMED -eq 1 ]]; then if [[ $CF_LOGIN -eq 1 ]]; then echo login; else echo named; fi; elif [[ $CLOUDFLARED -eq 1 ]]; then echo quick; else echo none; fi)
 EOF
   exit 0
 }
@@ -2868,6 +2942,7 @@ start_services
 verify_site
 setup_cloudflared
 setup_cf_named
+setup_cf_login
 if [[ $CF_NAMED -eq 1 ]]; then PUBLIC_URL="https://$DOMAIN"
 else PUBLIC_URL="${CF_URL:-$([ $SKIP_TLS -eq 1 ] && echo http || echo https)://$DOMAIN}"; fi
 
