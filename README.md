@@ -57,7 +57,7 @@ Dark theme, indigo accents, glass panels, dotted background. Light and high-cont
 
 - Installed with `--lang tr`, so the ErenDev OAuth button **is** shown when the UI is Turkish. Switch the language dropdown to English and the button disappears on the next page load.
 - Reset nightly at 03:00 UTC.
-- Admin demo: `info@erendev.xyz` / `demo-admin-2026` (rotated weekly).
+
 
 ---
 
