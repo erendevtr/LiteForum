@@ -7,7 +7,7 @@ umask 027
 
 DOMAIN=""; ADMIN_EMAIL=""; EMAIL=""
 LANG_CODE="tr"
-DRY_RUN=0; SKIP_TLS=0; NO_FIREWALL=0
+DRY_RUN=0; SKIP_TLS=0; NO_FIREWALL=0; CLOUDFLARED=0
 APP_DIR="/var/www/liteforum"; DATA_DIR="/var/lib/liteforum"; LOG_DIR="/var/log/liteforum"
 SVC_USER="liteforum"; PHP_VER=""; INSTALL_LOG="/var/log/liteforum-install.log"
 
@@ -20,6 +20,7 @@ usage() { cat <<EOT
 LiteForum Installer
   --domain <fqdn>   --email <mail>   --admin <mail>   --lang <tr|en>
   --skip-tls        --no-firewall    --dry-run        -h|--help
+  --cloudflared     (no --domain: expose via Cloudflare quick tunnel)
 EOT
 exit 0; }
 
@@ -27,13 +28,19 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --domain) DOMAIN="$2"; shift 2;; --email) EMAIL="$2"; shift 2;;
   --admin) ADMIN_EMAIL="$2"; shift 2;; --lang) LANG_CODE="$2"; shift 2;;
   --skip-tls) SKIP_TLS=1; shift;; --no-firewall) NO_FIREWALL=1; shift;;
-  --dry-run) DRY_RUN=1; shift;; -h|--help) usage;;
+  --dry-run) DRY_RUN=1; shift;; --cloudflared) CLOUDFLARED=1; shift;;
+  -h|--help) usage;;
   *) die "Unknown arg: $1";;
 esac; done
 
 [[ "$LANG_CODE" == "tr" || "$LANG_CODE" == "en" ]] || die "--lang must be tr|en"
 [[ $EUID -eq 0 ]] || die "root required"
-[[ -n "$DOMAIN" ]] || die "--domain required"
+if [[ -z "$DOMAIN" ]]; then
+  [[ $CLOUDFLARED -eq 1 ]] || die "--domain or --cloudflared required"
+  DOMAIN="localhost"; SKIP_TLS=1
+elif [[ $CLOUDFLARED -eq 1 ]]; then
+  die "Use either --domain or --cloudflared, not both"
+fi
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${DOMAIN}}"; EMAIL="${EMAIL:-$ADMIN_EMAIL}"
 
 preflight() {
@@ -2726,6 +2733,60 @@ verify_site() {
   done
 }
 
+install_cloudflared() {
+  if command -v cloudflared >/dev/null 2>&1; then ok "cloudflared already installed"; return; fi
+  local arch
+  case "$(dpkg --print-architecture)" in
+    amd64) arch=amd64;; arm64) arch=arm64;; armhf) arch=arm;;
+    *) die "Unsupported architecture for cloudflared";;
+  esac
+  curl -fsSL -o /tmp/cloudflared.deb \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb" \
+    || die "cloudflared download failed"
+  dpkg -i /tmp/cloudflared.deb >/dev/null 2>&1 || apt-get install -f -y -qq
+  rm -f /tmp/cloudflared.deb
+  command -v cloudflared >/dev/null 2>&1 || die "cloudflared install failed"
+  ok "cloudflared installed"
+}
+
+setup_cloudflared() {
+  [[ $CLOUDFLARED -eq 1 ]] || return 0
+  install_cloudflared
+  cat > /etc/systemd/system/liteforum-cloudflared.service <<UNIT
+[Unit]
+Description=LiteForum Cloudflare quick tunnel
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:80
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now liteforum-cloudflared >/dev/null 2>&1 || true
+
+  CF_URL=""
+  for _ in $(seq 1 30); do
+    CF_URL="$(journalctl -u liteforum-cloudflared --no-pager -n 300 2>/dev/null \
+      | grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | tail -1 || true)"
+    [[ -n "$CF_URL" ]] && break
+    sleep 2
+  done
+  if [[ -z "$CF_URL" ]]; then
+    warn "Tunnel URL not found — check: journalctl -u liteforum-cloudflared -n 50"
+    return
+  fi
+
+  # Point the app's base_url and OAuth redirect at the tunnel URL
+  sed -i "s|https://localhost|$CF_URL|g" "$APP_DIR/config/config.php"
+  ok "Cloudflare tunnel: $CF_URL"
+}
+
 [[ $DRY_RUN -eq 1 ]] && {
   cat <<EOF
 DRY-RUN:
@@ -2735,6 +2796,7 @@ DRY-RUN:
   AppDir : $APP_DIR
   DataDir: $DATA_DIR
   TLS    : $([[ $SKIP_TLS -eq 1 ]] && echo skip || echo yes)
+  Tunnel : $([[ $CLOUDFLARED -eq 1 ]] && echo cloudflared || echo none)
 EOF
   exit 0
 }
@@ -2760,12 +2822,15 @@ setup_tls
 write_nginx
 start_services
 verify_site
+setup_cloudflared
+PUBLIC_URL="${CF_URL:-$([ $SKIP_TLS -eq 1 ] && echo http || echo https)://$DOMAIN}"
 
 CRED_FILE="/root/liteforum-credentials.txt"
 cat > "$CRED_FILE" <<EOF
 LiteForum Installation
 ======================
-URL             : $([ $SKIP_TLS -eq 1 ] && echo http || echo https)://$DOMAIN
+URL             : $PUBLIC_URL
+Tunnel          : $([[ $CLOUDFLARED -eq 1 ]] && echo "cloudflared quick tunnel (URL changes on restart)" || echo none)
 Install lang    : $LANG_CODE
 ErenDev OAuth   : $([[ $LANG_CODE == tr ]] && echo "shown only when UI=tr" || echo "hidden (no credentials)")
 Admin email     : $ADMIN_EMAIL
@@ -2804,7 +2869,7 @@ chmod 0600 "$CRED_FILE"
 
 echo
 echo "============================================================"
-echo " LiteForum ready → $([ $SKIP_TLS -eq 1 ] && echo http || echo https)://$DOMAIN"
+echo " LiteForum ready → $PUBLIC_URL"
 echo " Admin: $ADMIN_EMAIL / $ADMIN_PASS"
 echo " Credentials: $CRED_FILE"
 echo "============================================================"
