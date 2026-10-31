@@ -9,6 +9,7 @@ DOMAIN=""; ADMIN_EMAIL=""; EMAIL=""
 LANG_CODE="tr"
 DRY_RUN=0; SKIP_TLS=0; NO_FIREWALL=0; CLOUDFLARED=0
 CF_TOKEN=""; CF_LOGIN=0; CF_NAMED=0
+HTTP_PORT=80
 APP_DIR="/var/www/liteforum"; DATA_DIR="/var/lib/liteforum"; LOG_DIR="/var/log/liteforum"
 SVC_USER="liteforum"; PHP_VER=""; INSTALL_LOG="/var/log/liteforum-install.log"
 
@@ -24,6 +25,7 @@ LiteForum Installer
   --cloudflared     (no --domain: expose via Cloudflare quick tunnel)
   --cf-token <tok>  (with --domain: Cloudflare named tunnel, no certbot)
   --cf-login        (with --domain: Cloudflare login link, auto DNS + tunnel)
+  --port <n>        (HTTP port, default 80; needs --skip-tls or a cf tunnel mode)
 EOT
 exit 0; }
 
@@ -33,6 +35,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --skip-tls) SKIP_TLS=1; shift;; --no-firewall) NO_FIREWALL=1; shift;;
   --dry-run) DRY_RUN=1; shift;; --cloudflared) CLOUDFLARED=1; shift;;
   --cf-token) CF_TOKEN="$2"; shift 2;; --cf-login) CF_LOGIN=1; shift;;
+  --port) HTTP_PORT="$2"; shift 2;;
   -h|--help) usage;;
   *) die "Unknown arg: $1";;
 esac; done
@@ -51,6 +54,10 @@ elif [[ -z "$DOMAIN" ]]; then
   DOMAIN="localhost"; SKIP_TLS=1
 elif [[ $CLOUDFLARED -eq 1 ]]; then
   die "Use either --domain or --cloudflared, not both"
+fi
+[[ "$HTTP_PORT" =~ ^[0-9]+$ ]] && (( HTTP_PORT >= 1 && HTTP_PORT <= 65535 )) || die "--port must be 1-65535"
+if [[ $SKIP_TLS -eq 0 && "$HTTP_PORT" != "80" ]]; then
+  die "--port needs --skip-tls or a Cloudflare tunnel mode (Let's Encrypt requires port 80)"
 fi
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${DOMAIN}}"; EMAIL="${EMAIL:-$ADMIN_EMAIL}"
 
@@ -2518,6 +2525,10 @@ PHP
 write_nginx() {
   install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
   SOCK="/run/php/${PHP_VER}-fpm-liteforum.sock"
+  # default_server only for quick tunnel (random Host); named tunnels/domains match by server_name
+  LISTEN_DEFAULT=" default_server"; [[ $CF_NAMED -eq 1 ]] && LISTEN_DEFAULT=""
+  LISTEN_BIND=""; [[ $CF_NAMED -eq 1 || $CLOUDFLARED -eq 1 ]] && LISTEN_BIND="127.0.0.1:"
+  IPV6_LINE=""; [[ -z "$LISTEN_BIND" ]] && IPV6_LINE="  listen [::]:${HTTP_PORT}${LISTEN_DEFAULT};"
   HAS_TLS=0
   [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]] && HAS_TLS=1
   [[ $SKIP_TLS -eq 1 ]] && HAS_TLS=0
@@ -2571,8 +2582,8 @@ NGINX
 limit_req_zone \$binary_remote_addr zone=lf_login:10m rate=10r/m;
 
 server {
-  listen 80 default_server;
-  listen [::]:80 default_server;
+  listen ${LISTEN_BIND}${HTTP_PORT}$LISTEN_DEFAULT;
+$IPV6_LINE
   server_name $DOMAIN;
   root $APP_DIR/public; index index.php;
   server_tokens off; charset utf-8;
@@ -2651,6 +2662,9 @@ setup_ufw() {
   ufw allow 22/tcp comment 'SSH'
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
+  if [[ $HTTP_PORT != 80 && $CF_NAMED -eq 0 && $CLOUDFLARED -eq 0 ]]; then
+    ufw allow "${HTTP_PORT}/tcp" comment 'LiteForum HTTP'
+  fi
   ufw --force enable
   ok "UFW enabled"
 }
@@ -2735,7 +2749,7 @@ start_services() {
 
 verify_site() {
   sleep 2
-  local base="http://127.0.0.1"
+  local base="http://127.0.0.1:$HTTP_PORT"
   for path in "/" "/category.php?slug=general" "/login.php" "/register.php" "/activity.php" "/stats.php" "/forgot-password.php" "/admin.php" "/settings.php"; do
     if curl -fsS -H "Host: $DOMAIN" "$base$path" -o /dev/null 2>/dev/null; then
       ok "HTTP $path"
@@ -2772,7 +2786,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:80
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:$HTTP_PORT
 Restart=always
 RestartSec=5
 
@@ -2872,7 +2886,7 @@ tunnel: $TUNNEL_ID
 credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
 ingress:
   - hostname: $DOMAIN
-    service: http://127.0.0.1:80
+    service: http://127.0.0.1:$HTTP_PORT
   - service: http_status:404
 YML
 
@@ -2914,6 +2928,7 @@ DRY-RUN:
   AppDir : $APP_DIR
   DataDir: $DATA_DIR
   TLS    : $([[ $SKIP_TLS -eq 1 ]] && echo skip || echo yes)
+  Port   : $HTTP_PORT
   Tunnel : $(if [[ $CF_NAMED -eq 1 ]]; then if [[ $CF_LOGIN -eq 1 ]]; then echo login; else echo named; fi; elif [[ $CLOUDFLARED -eq 1 ]]; then echo quick; else echo none; fi)
 EOF
   exit 0
@@ -2945,6 +2960,9 @@ setup_cf_named
 setup_cf_login
 if [[ $CF_NAMED -eq 1 ]]; then PUBLIC_URL="https://$DOMAIN"
 else PUBLIC_URL="${CF_URL:-$([ $SKIP_TLS -eq 1 ] && echo http || echo https)://$DOMAIN}"; fi
+if [[ $CF_NAMED -eq 0 && $CLOUDFLARED -eq 0 && $SKIP_TLS -eq 1 && $HTTP_PORT != 80 ]]; then
+  PUBLIC_URL="http://$DOMAIN:$HTTP_PORT"
+fi
 
 CRED_FILE="/root/liteforum-credentials.txt"
 cat > "$CRED_FILE" <<EOF
