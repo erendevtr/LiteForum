@@ -61,6 +61,23 @@ if [[ $SKIP_TLS -eq 0 && "$HTTP_PORT" != "80" ]]; then
 fi
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${DOMAIN}}"; EMAIL="${EMAIL:-$ADMIN_EMAIL}"
 
+# Inputs are interpolated into nginx, PHP, and SQL. Reject anything outside a
+# strict allow-list so a crafted argument cannot break out of those contexts.
+validate_inputs() {
+  DOMAIN="${DOMAIN,,}"
+  local re_dom='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
+  local re_mail='^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$'
+  if [[ "$DOMAIN" != "localhost" ]]; then
+    [[ "$DOMAIN" =~ $re_dom ]] || die "Invalid --domain: $DOMAIN"
+  fi
+  [[ "$ADMIN_EMAIL" =~ $re_mail ]] || die "Invalid --admin email"
+  [[ "$EMAIL" =~ $re_mail ]]       || die "Invalid --email"
+  if [[ -n "$CF_TOKEN" ]]; then
+    [[ "$CF_TOKEN" =~ ^[A-Za-z0-9+/=_.-]{20,}$ ]] || die "Invalid --cf-token format"
+  fi
+}
+validate_inputs
+
 preflight() {
   if ! command -v sqlite3 >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
@@ -111,7 +128,7 @@ create_dirs() {
   install -d -o root      -g root      -m 0755 "$APP_DIR" "$APP_DIR"/{public,app,config,lang,views,plugins}
   install -d -o root      -g root      -m 0755 "$APP_DIR/public/oauth/erendev"
   install -d -o $SVC_USER -g $SVC_USER -m 0700 "$DATA_DIR" "$DATA_DIR"/{sessions,tmp,backups,uploads}
-  install -d -o root      -g adm       -m 0750 "$LOG_DIR"
+  install -d -o $SVC_USER -g adm -m 0750 "$LOG_DIR"
 }
 
 gen_secrets() {
@@ -255,6 +272,8 @@ SQL
 }
 
 write_env() {
+  local BASE_SCHEME=https
+  if [[ $SKIP_TLS -eq 1 && $CF_NAMED -eq 0 && $CLOUDFLARED -eq 0 ]]; then BASE_SCHEME=http; fi
   cat > "$APP_DIR/config/config.php" <<PHP
 <?php
 return [
@@ -263,7 +282,7 @@ return [
     'available_langs' => ['tr','en','fr','de','es','ar'],
     'app_key'         => '$APP_KEY',
     'db_path'         => '$DATA_DIR/liteforum.db',
-    'base_url'        => 'https://$DOMAIN',
+    'base_url'        => '$BASE_SCHEME://$DOMAIN',
     'session_name'    => 'LF_SESSION',
     'session_lifetime'=> 7200,
     'erendev' => [
@@ -598,7 +617,7 @@ require LF_ROOT . '/app/mail.php';
 session_name($config['session_name']);
 session_set_cookie_params([
   'lifetime'=>0,'path'=>'/',
-  'secure'=>!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS']==='on',
+  'secure'=>str_starts_with($config['base_url'] ?? '', 'https://'),
   'httponly'=>true,'samesite'=>'Strict',
 ]);
 session_start();
@@ -615,7 +634,7 @@ $GLOBALS['__app_name'] = settings_get($db, 'app_name', 'LiteForum');
 $GLOBALS['__app_tagline'] = settings_get($db, 'app_tagline', '');
 
 if (!empty($_SESSION['user']['id'])) {
-  $st = $db->prepare('SELECT banned, ban_reason FROM users WHERE id=?');
+  $st = $db->prepare('SELECT banned, role FROM users WHERE id=?');
   $st->execute([(int)$_SESSION['user']['id']]);
   $u = $st->fetch();
   if ($u && (int)$u['banned'] === 1) {
@@ -624,7 +643,12 @@ if (!empty($_SESSION['user']['id'])) {
     http_response_code(403);
     die(t('banned_msg'));
   }
-  $db->prepare('UPDATE users SET last_seen_at=? WHERE id=?')->execute([time(), (int)$_SESSION['user']['id']]);
+  if (!$u) {
+    $_SESSION['user'] = null;
+  } else {
+    $_SESSION['user']['role'] = $u['role'];
+    $db->prepare('UPDATE users SET last_seen_at=? WHERE id=?')->execute([time(), (int)$_SESSION['user']['id']]);
+  }
 }
 PHP
 
@@ -658,7 +682,15 @@ function rate_limit(PDO $db, string $bucket, string $ip, int $max, int $w): bool
   $db->prepare('INSERT INTO rate_limits(bucket,ip,ts) VALUES(?,?,?)')->execute([$bucket,$ip,$now]);
   return true;
 }
-function client_ip(): string { return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0'; }
+function client_ip(): string {
+  $remote = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+  $cf = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? '';
+  if (in_array($remote, ['127.0.0.1', '::1'], true) && is_string($cf) && filter_var($cf, FILTER_VALIDATE_IP)) return $cf;
+  return $remote;
+}
+function safe_next(string $p): string {
+  return (preg_match('#^/(?![/\\\\])#', $p) === 1 && !preg_match('/[\r\n]/', $p)) ? $p : '/';
+}
 function audit(PDO $db, ?array $actor, string $action, ?string $kind=null, ?int $id=null, array $meta=[]): void {
   $db->prepare('INSERT INTO audit_log(actor_id,action,target_kind,target_id,meta,ip,ts) VALUES(?,?,?,?,?,?,?)')
      ->execute([$actor['id']??null, $action, $kind, $id, json_encode($meta), client_ip(), time()]);
@@ -829,7 +861,7 @@ function search_posts(PDO $db, string $q, ?int $categoryId=null, ?int $authorId=
   $q = trim($q);
   if ($q === '') return ['rows'=>[], 'total'=>0];
   $sql = 'SELECT p.id, p.topic_id, p.user_id, p.created_at,
-                 snippet(posts_fts, 0, \'<mark>\', \'</mark>\', \'…\', 20) AS snippet,
+                 snippet(posts_fts, 0, char(2), char(3), \'…\', 20) AS snippet,
                  bm25(posts_fts) AS rank,
                  t.title AS topic_title, t.category_id, u.username
           FROM posts_fts
@@ -962,15 +994,15 @@ function generate_reset_token(PDO $db, int $userId): string {
   $token = bin2hex(random_bytes(32));
   $db->prepare('DELETE FROM password_resets WHERE user_id=?')->execute([$userId]);
   $db->prepare('INSERT INTO password_resets(token,user_id,expires_at) VALUES(?,?,?)')
-     ->execute([$token, $userId, time() + 3600]);
+     ->execute([hash('sha256', $token), $userId, time() + 3600]);
   return $token;
 }
 function consume_reset_token(PDO $db, string $token): ?int {
   $st = $db->prepare('SELECT user_id FROM password_resets WHERE token=? AND expires_at>? AND used=0');
-  $st->execute([$token, time()]);
+  $st->execute([hash('sha256', $token), time()]);
   $row = $st->fetch();
   if (!$row) return null;
-  $db->prepare('UPDATE password_resets SET used=1 WHERE token=?')->execute([$token]);
+  $db->prepare('UPDATE password_resets SET used=1 WHERE token=?')->execute([hash('sha256', $token)]);
   return (int)$row['user_id'];
 }
 PHP
@@ -1028,6 +1060,7 @@ $online = online_count($GLOBALS['db']);
   button:active,.btn:active{transform:translateY(1px)}
   button:disabled{opacity:.5;cursor:not-allowed;filter:none}
   .btn-ghost{background:transparent;border:1px solid var(--border);color:var(--fg)}
+  .erd-btn{transition:transform .15s}.erd-btn:hover{transform:scale(1.03)}
   .btn-ghost:hover{background:var(--panel2);filter:none;box-shadow:none;color:var(--fg)}
   .btn-sm{padding:.4rem .8rem;font-size:.85rem}
   .btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
@@ -1119,7 +1152,7 @@ $online = online_count($GLOBALS['db']);
     </form>
     <form method="post" action="/lang.php" style="margin:0">
       <?= csrf_field() ?>
-      <select name="lang" onchange="this.form.submit()" style="width:auto;padding:.35rem .55rem;font-size:.8rem">
+      <select name="lang" data-autosubmit style="width:auto;padding:.35rem .55rem;font-size:.8rem">
         <?php foreach (($GLOBALS['__config']['available_langs'] ?? ['tr','en']) as $lc): ?>
           <option value="<?= e($lc) ?>" <?= ($_SESSION['ui_lang']??'')===$lc?'selected':'' ?>><?= e(strtoupper($lc)) ?></option>
         <?php endforeach; ?>
@@ -1152,6 +1185,7 @@ $online = online_count($GLOBALS['db']);
   <p><strong><?= e($appName) ?></strong> <?= e($appTagline) ?></p>
   <p style="margin-top:.5rem"><span class="online-dot"></span><?= $online ?> <?= e(t('online_users')) ?></p>
 </footer>
+<script src="/assets/app.js" defer></script>
 </body></html>
 PHP
 
@@ -1299,7 +1333,7 @@ PHP
         <button class="btn-ghost btn btn-sm" type="submit">🔒 <?= e((int)$topic['is_locked'] ? t('unlock') : t('lock')) ?></button>
       </form>
       <?php if (is_admin($u)): ?>
-        <form method="post" action="/mod.php" style="margin:0" onsubmit="return confirm('<?= e(t('delete_confirm')) ?>')">
+        <form method="post" action="/mod.php" style="margin:0" data-confirm="<?= e(t('delete_confirm')) ?>">
           <?= csrf_field() ?>
           <input type="hidden" name="action" value="delete_topic">
           <input type="hidden" name="topic_id" value="<?= (int)$topic['id'] ?>">
@@ -1351,7 +1385,7 @@ PHP
     <?php if (is_mod($u) && !(int)$p['is_deleted']): ?>
       <div class="mod-bar">
         <?php if (is_admin($u) || (int)$p['user_id'] === (int)$u['id']): ?>
-          <form method="post" action="/mod.php" style="margin:0" onsubmit="return confirm('<?= e(t('delete_confirm')) ?>')">
+          <form method="post" action="/mod.php" style="margin:0" data-confirm="<?= e(t('delete_confirm')) ?>">
             <?= csrf_field() ?>
             <input type="hidden" name="action" value="delete_post">
             <input type="hidden" name="post_id" value="<?= $pid ?>">
@@ -1422,7 +1456,7 @@ PHP
          . '&state='        . rawurlencode($state);
   ?>
   <div style="margin-top:1.5rem;padding-top:1.5rem;border-top:1px solid var(--border);text-align:center">
-    <a href="<?= e($url) ?>"><img src="<?= e($config['erendev']['button_svg']) ?>" alt="ErenDev ile Giriş Yap" width="240" height="48" style="height:48px;transition:transform .15s" onmouseover="this.style.transform='scale(1.03)'" onmouseout="this.style.transform='scale(1)'"></a>
+    <a href="<?= e($url) ?>"><img src="<?= e($config['erendev']['button_svg']) ?>" alt="ErenDev ile Giriş Yap" width="240" height="48" class="erd-btn" style="height:48px"></a>
   </div>
   <?php endif; ?>
   <p class="muted text-sm" style="margin-top:1.25rem;text-align:center;display:flex;justify-content:space-between">
@@ -1518,7 +1552,7 @@ PHP
       <div class="topic-row" style="display:block">
         <a href="/topic.php?id=<?= (int)$r['topic_id'] ?>" style="font-weight:600;font-size:1rem"><?= e($r['topic_title']) ?></a>
         <div class="meta" style="margin-top:.35rem;color:var(--fg-muted);font-size:.82rem">@<?= e($r['username']) ?></div>
-        <p style="margin:.5rem 0 0;color:var(--fg)"><?= $r['snippet'] ?></p>
+        <p style="margin:.5rem 0 0;color:var(--fg)"><?= str_replace([chr(2), chr(3)], ['<mark>', '</mark>'], e($r['snippet'])) ?></p>
       </div>
     <?php endforeach; ?>
   <?php endif; ?>
@@ -1620,7 +1654,7 @@ PHP
   <?php if (is_admin($me) && (int)$profile['id'] !== (int)$me['id']): ?>
     <div class="flex flex-col" style="gap:.4rem">
       <?php if (!(int)$profile['banned']): ?>
-        <form method="post" action="/mod.php" style="margin:0" onsubmit="return confirm('<?= e(t('delete_confirm')) ?>')">
+        <form method="post" action="/mod.php" style="margin:0" data-confirm="<?= e(t('delete_confirm')) ?>">
           <?= csrf_field() ?>
           <input type="hidden" name="action" value="ban_user">
           <input type="hidden" name="user_id" value="<?= (int)$profile['id'] ?>">
@@ -1763,7 +1797,7 @@ PHP
             <td>
               <div class="flex" style="gap:.35rem">
                 <a href="/admin.php?edit_cat=<?= (int)$c['id'] ?>" class="btn-ghost btn btn-sm"><?= e(t('edit')) ?></a>
-                <form method="post" action="/admin.php" style="margin:0" onsubmit="return confirm('<?= e(t('delete_confirm')) ?>')">
+                <form method="post" action="/admin.php" style="margin:0" data-confirm="<?= e(t('delete_confirm')) ?>">
                   <?= csrf_field() ?>
                   <input type="hidden" name="action" value="delete_category">
                   <input type="hidden" name="id" value="<?= (int)$c['id'] ?>">
@@ -1880,6 +1914,19 @@ PHP
 }
 
 write_public() {
+  install -d -o root -g root -m 0755 "$APP_DIR/public/assets"
+  cat > "$APP_DIR/public/assets/app.js" <<'JS'
+document.addEventListener('change', function (e) {
+  var el = e.target;
+  if (el && el.hasAttribute && el.hasAttribute('data-autosubmit') && el.form) el.form.submit();
+});
+document.addEventListener('submit', function (e) {
+  var msg = e.target && e.target.getAttribute && e.target.getAttribute('data-confirm');
+  if (msg !== null && !window.confirm(msg)) e.preventDefault();
+});
+JS
+  chmod 0644 "$APP_DIR/public/assets/app.js"
+
   cat > "$APP_DIR/public/index.php" <<'PHP'
 <?php
 declare(strict_types=1);
@@ -1920,7 +1967,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       $st=$db->prepare('SELECT * FROM users WHERE email=?'); $st->execute([$email]); $u=$st->fetch();
       if ($u && password_verify_safe($pass,$u['password_hash'])) {
         if ((int)$u['banned'] === 1) { $error = t('banned_msg'); }
-        else { auth_login($u); $next = $_GET['next'] ?? '/'; redirect($next); }
+        else { auth_login($u); redirect(safe_next((string)($_GET['next'] ?? '/'))); }
       } else { $error=t('bad_credentials'); }
     }
   }
@@ -2309,7 +2356,7 @@ if ($postId > 0 && in_array($emoji, ['👍','❤️','🔥','😂','😮'], true
     notif_for_reaction($db, $postId, (int)$u['id'], $emoji);
   }
 }
-redirect($back);
+redirect(safe_next($back));
 PHP
 
   cat > "$APP_DIR/public/mod.php" <<'PHP'
@@ -2340,7 +2387,7 @@ if ($action === 'lock' && $topicId > 0) {
 if ($action === 'delete_post' && $postId > 0) {
   $st = $db->prepare('SELECT user_id, topic_id FROM posts WHERE id=?'); $st->execute([$postId]);
   $p = $st->fetch();
-  if ($p && (is_admin($u) || (int)$p['user_id'] === (int)$u['id'])) {
+  if ($p) {
     $db->prepare('UPDATE posts SET is_deleted=1 WHERE id=?')->execute([$postId]);
     audit($db, $u, 'post.delete', 'post', $postId);
   }
@@ -2489,15 +2536,18 @@ curl_setopt_array($ch2,[
 $u2=json_decode((string)curl_exec($ch2),true);
 if (empty($u2['sub'])||empty($u2['email'])) { http_response_code(502); exit('Bad userinfo'); }
 $sub=(string)$u2['sub']; $email=(string)$u2['email'];
-$username=$u2['preferred_username'] ?? ('ed_'.substr(hash('sha256',$sub),0,10));
-$st=$db->prepare('SELECT * FROM users WHERE erendev_sub=? OR email=?');
-$st->execute([$sub,$email]); $user=$st->fetch();
+if (!filter_var($u2['email_verified'] ?? false, FILTER_VALIDATE_BOOLEAN)) { http_response_code(403); exit('Email not verified at provider.'); }
+$username=(string)($u2['preferred_username'] ?? '');
+if (!preg_match('/^[A-Za-z0-9_\-]{3,32}$/', $username)) { $username='ed_'.substr(hash('sha256',$sub),0,10); }
+$st=$db->prepare('SELECT * FROM users WHERE erendev_sub=?');
+$st->execute([$sub]); $user=$st->fetch();
 if (!$user) {
+  // Never auto-link to an existing local account by email: that would allow takeover.
+  $chk=$db->prepare('SELECT 1 FROM users WHERE email=?'); $chk->execute([$email]);
+  if ($chk->fetchColumn()) { http_response_code(409); exit(t('email_taken')); }
   $db->prepare('INSERT INTO users(username,email,password_hash,erendev_sub,created_at,last_seen_at) VALUES(?,?,?,?,?,?)')
      ->execute([$username,$email,password_hash_safe(bin2hex(random_bytes(24))),$sub,time(),time()]);
   $st=$db->prepare('SELECT * FROM users WHERE id=?'); $st->execute([$db->lastInsertId()]); $user=$st->fetch();
-} else {
-  $db->prepare('UPDATE users SET erendev_sub=? WHERE id=?')->execute([$sub,$user['id']]);
 }
 if ((int)$user['banned'] === 1) { http_response_code(403); exit(t('banned_msg')); }
 auth_login($user); redirect('/');
@@ -2559,7 +2609,7 @@ server {
   add_header X-Frame-Options "DENY" always;
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
+  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
   location = /favicon.ico { access_log off; return 204; }
   location = /login.php { limit_req zone=lf_login burst=5 nodelay; fastcgi_pass unix:$SOCK; include fastcgi_params; fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name; fastcgi_param HTTP_PROXY ""; }
   location ~ \.php\$ {
@@ -2588,7 +2638,7 @@ $IPV6_LINE
   root $APP_DIR/public; index index.php;
   server_tokens off; charset utf-8;
   client_max_body_size 10m;
-  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
+  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
   add_header X-Frame-Options "DENY" always;
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "strict-origin-when-cross-origin" always;
@@ -2660,10 +2710,10 @@ setup_ufw() {
   ufw --force reset >/dev/null 2>&1 || true
   ufw default deny incoming; ufw default allow outgoing
   ufw allow 22/tcp comment 'SSH'
-  ufw allow 80/tcp comment 'HTTP'
-  ufw allow 443/tcp comment 'HTTPS'
-  if [[ $HTTP_PORT != 80 && $CF_NAMED -eq 0 && $CLOUDFLARED -eq 0 ]]; then
-    ufw allow "${HTTP_PORT}/tcp" comment 'LiteForum HTTP'
+  if [[ $CF_NAMED -eq 0 && $CLOUDFLARED -eq 0 ]]; then
+    ufw allow 80/tcp comment 'HTTP'
+    ufw allow 443/tcp comment 'HTTPS'
+    if [[ $HTTP_PORT != 80 ]]; then ufw allow "${HTTP_PORT}/tcp" comment 'LiteForum HTTP'; fi
   fi
   ufw --force enable
   ok "UFW enabled"
@@ -2671,7 +2721,7 @@ setup_ufw() {
 
 setup_fail2ban() {
   install -d -o root -g root -m 0755 /etc/fail2ban/jail.d
-  cat > /etc/fail2ban/jail.d/liteforum.local <<'F2B'
+  cat > /etc/fail2ban/jail.d/liteforum.local <<F2B
 [sshd]
 enabled = true
 maxretry = 4
@@ -2679,7 +2729,16 @@ findtime = 10m
 bantime = 1h
 [nginx-http-auth]
 enabled = true
+port = http,https
+logpath = $LOG_DIR/error.log
 maxretry = 5
+findtime = 10m
+bantime = 1h
+[nginx-limit-req]
+enabled = true
+port = http,https
+logpath = $LOG_DIR/error.log
+maxretry = 10
 findtime = 10m
 bantime = 1h
 F2B
@@ -2716,6 +2775,7 @@ HTTP
     systemctl enable --now certbot.timer 2>/dev/null || true
   else
     warn "Certbot failed — continuing with HTTP"
+    sed -i "s|=> 'https://$DOMAIN',|=> 'http://$DOMAIN',|" "$APP_DIR/config/config.php"
     SKIP_TLS=1
   fi
   rm -f /etc/nginx/sites-enabled/liteforum.http
@@ -2729,7 +2789,7 @@ INSERT OR IGNORE INTO categories(slug,name_tr,name_en,name_fr,name_de,name_es,na
  ('announcements','Duyurular','Announcements','Annonces','Ankündigungen','Anuncios','إعلانات','Resmi duyurular','Official announcements','📢',20),
  ('support','Destek','Support','Support','Hilfe','Soporte','دعم','Yardım ve destek','Help and support','🛠️',30);
 SQL
-  HASH="$(php -r 'echo password_hash($argv[1], PASSWORD_ARGON2ID);' "$ADMIN_PASS")"
+  HASH="$(printf '%s' "$ADMIN_PASS" | php -r 'echo password_hash(stream_get_contents(STDIN), PASSWORD_ARGON2ID);')"
   sqlite3 "$DB" <<SQL
 INSERT INTO users(username,email,password_hash,role,created_at,last_seen_at)
 VALUES('admin','$ADMIN_EMAIL','$HASH','admin',strftime('%s','now'),strftime('%s','now'))
@@ -2919,6 +2979,37 @@ UNIT
   warn "Tunnel connection not confirmed — check: journalctl -u liteforum-cloudflared -n 50"
 }
 
+setup_backups() {
+  local PASS=/etc/liteforum/backup.pass
+  install -d -o root -g root -m 0700 /etc/liteforum
+  if [[ ! -s "$PASS" ]]; then ( umask 077; openssl rand -base64 48 > "$PASS" ); fi
+  chmod 0600 "$PASS"
+  cat > /usr/local/sbin/liteforum-backup <<'SH'
+#!/usr/bin/env bash
+# Consistent SQLite snapshot (.backup is WAL-safe), encrypted, 14-day retention.
+set -Eeuo pipefail
+umask 077
+DB=/var/lib/liteforum/liteforum.db
+OUT=/var/lib/liteforum/backups
+PASS=/etc/liteforum/backup.pass
+STAMP="$(date -u +%F-%H%M)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+sqlite3 "$DB" ".backup '$TMP/liteforum.db'"
+tar czf - -C "$TMP" liteforum.db \
+  | openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:$PASS" -out "$OUT/lf-$STAMP.tar.gz.enc"
+chown liteforum:liteforum "$OUT/lf-$STAMP.tar.gz.enc"
+find "$OUT" -name 'lf-*.tar.gz.enc' -mtime +14 -delete
+SH
+  chmod 0700 /usr/local/sbin/liteforum-backup
+  cat > /etc/cron.d/liteforum-backup <<'CRON'
+SHELL=/bin/bash
+45 3 * * * root /usr/local/sbin/liteforum-backup >>/var/log/liteforum/backup.log 2>&1
+CRON
+  chmod 0644 /etc/cron.d/liteforum-backup
+  ok "Encrypted daily backup scheduled (03:45 UTC, 14-day retention)"
+}
+
 [[ $DRY_RUN -eq 1 ]] && {
   cat <<EOF
 DRY-RUN:
@@ -2951,6 +3042,7 @@ setup_ufw
 setup_fail2ban
 setup_sysctl
 seed_data
+setup_backups
 setup_tls
 write_nginx
 start_services
@@ -2965,6 +3057,7 @@ if [[ $CF_NAMED -eq 0 && $CLOUDFLARED -eq 0 && $SKIP_TLS -eq 1 && $HTTP_PORT != 
 fi
 
 CRED_FILE="/root/liteforum-credentials.txt"
+install -m 0600 /dev/null "$CRED_FILE"
 cat > "$CRED_FILE" <<EOF
 LiteForum Installation
 ======================
