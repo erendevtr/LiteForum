@@ -217,7 +217,19 @@ curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
   --lang   en
 ```
 
-Domain behind Cloudflare, named tunnel (no certbot, stable address):
+Domain behind Cloudflare, login link (easiest, no dashboard steps):
+
+```bash
+curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
+  --domain forum.example.com \
+  --cf-login \
+  --admin  admin@example.com \
+  --lang   tr
+```
+
+The installer prints a Cloudflare login link. Open it, choose your zone, and the rest is automatic: tunnel creation, DNS record, and the systemd service.
+
+Domain behind Cloudflare, token-based named tunnel (no certbot, stable address):
 
 ```bash
 curl -fsSL https://get.erendev.xyz/install.sh | sudo bash -s -- \
@@ -250,7 +262,7 @@ sudo cat /root/liteforum-credentials.txt
 https://forum.example.com
 ```
 
-With `--cf-token`, the URL is `https://forum.example.com`. With `--cloudflared`, the random `trycloudflare.com` address is printed at the end of the install and written to the credentials file under `URL`.
+With `--cf-login` or `--cf-token`, the URL is `https://forum.example.com`. With `--cloudflared`, the random `trycloudflare.com` address is printed at the end of the install and written to the credentials file under `URL`.
 
 TLS is provisioned by Let's Encrypt in plain domain mode. The certificate renews automatically via `certbot.timer`. In both Cloudflare modes, TLS is handled by Cloudflare and certbot is not used.
 
@@ -261,6 +273,7 @@ If Let's Encrypt fails (closed port, DNS issue, rate limit), the installer conti
 | Flag | Default | Description |
 |---|---|---|
 | `--domain <fqdn>` | *required* unless `--cloudflared` | Domain for the site. Used for the Let's Encrypt certificate, or as the public hostname with `--cf-token` |
+| `--cf-login` | off | Create a named tunnel through a Cloudflare login link. Creates the tunnel and DNS record automatically. TLS is terminated by Cloudflare, certbot is skipped. Requires `--domain`. Cannot be combined with `--cf-token` |
 | `--cf-token <token>` | off | Run a Cloudflare named tunnel for `--domain`. TLS is terminated by Cloudflare, certbot is skipped. Requires `--domain` |
 | `--cloudflared` | off | Expose the forum through a Cloudflare quick tunnel with a random address. Cannot be combined with `--domain` or `--cf-token` |
 | `--email <mail>` | `admin@<domain>` | Let's Encrypt contact + admin email |
