@@ -280,6 +280,7 @@ If Let's Encrypt fails (closed port, DNS issue, rate limit), the installer conti
 | `--admin <mail>` | `admin@<domain>` | Admin account email |
 | `--lang <tr\|en>` | `tr` | Install language — controls whether ErenDev OAuth credentials exist |
 | `--skip-tls` | off | HTTP only, no certbot; HSTS disabled |
+| `--port <n>` | `80` | HTTP port nginx listens on. Needs `--skip-tls` or a Cloudflare tunnel mode. Tunnel modes bind to `127.0.0.1` only, and the port is not opened in UFW |
 | `--no-firewall` | off | Skip UFW setup |
 | `--dry-run` | off | Print plan, make no changes |
 
