@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# LiteForum — Complete One-Shot Installer (v3 — All Features)
+# LiteForum — Complete One-Shot Installer (v4 — All Features)
 # =============================================================================
 set -Eeuo pipefail
 umask 027
@@ -269,6 +269,96 @@ SQL
   sqlite3 "$DB" "INSERT INTO settings(key,value) VALUES('app_name','LiteForum'),('app_tagline','A lightweight, modern forum');"
   chown "$SVC_USER:$SVC_USER" "$DB"* 2>/dev/null; chmod 0600 "$DB"* 2>/dev/null
   ok "SQLite: $DB"
+}
+
+migrate_v4() {
+  local DB="$DATA_DIR/liteforum.db" v
+  v="$(sqlite3 "$DB" "SELECT value FROM settings WHERE key='schema_version'" 2>/dev/null || true)"
+  if [[ "${v:-0}" -ge 4 ]]; then ok "Schema v4 already applied"; return; fi
+  sqlite3 "$DB" <<'SQL' || die "Schema v4 tables failed"
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS roles(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  color_hex TEXT NOT NULL DEFAULT '#6366f1' CHECK(length(color_hex)=7 AND substr(color_hex,1,1)='#'),
+  power_level INTEGER NOT NULL DEFAULT 0 CHECK(power_level BETWEEN 0 AND 99)
+);
+CREATE TABLE IF NOT EXISTS tags(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  slug TEXT NOT NULL UNIQUE
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS tags_fts USING fts5(name, content='tags', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS tags_ai AFTER INSERT ON tags BEGIN
+  INSERT INTO tags_fts(rowid,name) VALUES (new.id,new.name);
+END;
+CREATE TRIGGER IF NOT EXISTS tags_ad AFTER DELETE ON tags BEGIN
+  INSERT INTO tags_fts(tags_fts,rowid,name) VALUES('delete',old.id,old.name);
+END;
+CREATE TRIGGER IF NOT EXISTS tags_au AFTER UPDATE ON tags BEGIN
+  INSERT INTO tags_fts(tags_fts,rowid,name) VALUES('delete',old.id,old.name);
+  INSERT INTO tags_fts(rowid,name) VALUES (new.id,new.name);
+END;
+CREATE TABLE IF NOT EXISTS topic_tags(
+  topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY(topic_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_topic_tags_tag ON topic_tags(tag_id, topic_id);
+CREATE TABLE IF NOT EXISTS category_tags(
+  category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+  tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY(category_id, tag_id)
+);
+CREATE TABLE IF NOT EXISTS uploads(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  post_id INTEGER REFERENCES posts(id) ON DELETE SET NULL,
+  stored_name TEXT NOT NULL UNIQUE,
+  original_name TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_jobs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','done','failed')),
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status, id);
+SQL
+  add_col() {
+    [[ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('$1') WHERE name='$2'")" == "1" ]] \
+      || sqlite3 "$DB" "ALTER TABLE $1 ADD COLUMN $2 $3" || die "ALTER $1.$2 failed"
+  }
+  add_col users role_id "INTEGER REFERENCES roles(id) ON DELETE SET NULL"
+  add_col users is_verified "INTEGER NOT NULL DEFAULT 0"
+  sqlite3 "$DB" <<'SQL' || die "Schema v4 seed failed"
+INSERT OR IGNORE INTO settings(key,value) VALUES
+  ('ai_enabled','0'),('ai_provider','anthropic'),('ai_model',''),('ai_api_key_enc',''),
+  ('turnstile_enabled','0'),('turnstile_site_key',''),('turnstile_secret_enc','');
+INSERT OR IGNORE INTO users(username,email,password_hash,role,created_at,last_seen_at,is_verified)
+  VALUES('asistan','ai@liteforum.invalid','!','member',strftime('%s','now'),strftime('%s','now'),1);
+INSERT INTO settings(key,value) SELECT 'ai_user_id', CAST(id AS TEXT) FROM users WHERE username='asistan'
+  ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO settings(key,value) VALUES('schema_version','4')
+  ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+SQL
+  chown "$SVC_USER:$SVC_USER" "$DB"* 2>/dev/null; chmod 0600 "$DB"* 2>/dev/null
+  ok "Schema migrated to v4"
+}
+
+setup_ai_cron() {
+  cat > /etc/cron.d/liteforum-ai <<CRON
+SHELL=/bin/bash
+* * * * * $SVC_USER /usr/bin/php $APP_DIR/app/ai-worker.php >>$LOG_DIR/ai-worker.log 2>&1
+CRON
+  chmod 0644 /etc/cron.d/liteforum-ai
+  ok "AI worker scheduled (every minute)"
 }
 
 write_env() {
@@ -613,6 +703,12 @@ require LF_ROOT . '/app/markdown.php';
 require LF_ROOT . '/app/avatar.php';
 require LF_ROOT . '/app/activity.php';
 require LF_ROOT . '/app/mail.php';
+require LF_ROOT . '/app/crypto.php';
+require LF_ROOT . '/app/turnstile.php';
+require LF_ROOT . '/app/upload.php';
+require LF_ROOT . '/app/tags.php';
+require LF_ROOT . '/app/ai.php';
+require LF_ROOT . '/app/admin-actions.php';
 
 session_name($config['session_name']);
 session_set_cookie_params([
@@ -632,9 +728,10 @@ $GLOBALS['__config'] = $config;
 $GLOBALS['__config_available_langs'] = $config['available_langs'] ?? ['tr','en'];
 $GLOBALS['__app_name'] = settings_get($db, 'app_name', 'LiteForum');
 $GLOBALS['__app_tagline'] = settings_get($db, 'app_tagline', '');
+$GLOBALS['__turnstile_site'] = settings_get($db, 'turnstile_enabled', '0') === '1' ? settings_get($db, 'turnstile_site_key', '') : '';
 
 if (!empty($_SESSION['user']['id'])) {
-  $st = $db->prepare('SELECT banned, role FROM users WHERE id=?');
+  $st = $db->prepare('SELECT u.banned, u.role, r.power_level AS role_power, r.name AS role_name, r.color_hex AS role_color FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE u.id=?');
   $st->execute([(int)$_SESSION['user']['id']]);
   $u = $st->fetch();
   if ($u && (int)$u['banned'] === 1) {
@@ -647,6 +744,9 @@ if (!empty($_SESSION['user']['id'])) {
     $_SESSION['user'] = null;
   } else {
     $_SESSION['user']['role'] = $u['role'];
+    $_SESSION['user']['role_power'] = (int)($u['role_power'] ?? 0);
+    $_SESSION['user']['role_name'] = $u['role_name'];
+    $_SESSION['user']['role_color'] = $u['role_color'];
     $db->prepare('UPDATE users SET last_seen_at=? WHERE id=?')->execute([time(), (int)$_SESSION['user']['id']]);
   }
 }
@@ -712,10 +812,14 @@ function cat_desc(array $cat, string $lc): string {
   return $cat[$k] ?? $cat['description_en'] ?? $cat['description_tr'] ?? '';
 }
 function is_mod(?array $u): bool {
-  return $u !== null && in_array($u['role'], ['moderator','admin'], true);
+  return $u !== null && (in_array($u['role'], ['moderator','admin'], true) || (int)($u['role_power'] ?? 0) >= 50);
 }
 function is_admin(?array $u): bool {
   return $u !== null && $u['role'] === 'admin';
+}
+function verified_badge(int $v): string {
+  if (!$v) return '';
+  return '<svg class="verified" width="14" height="14" viewBox="0 0 24 24" role="img" aria-label="Doğrulanmış hesap" style="vertical-align:-2px;margin-left:3px"><circle cx="12" cy="12" r="10" fill="var(--accent-500)"/><path d="M7 12.5l3 3 7-7" stroke="#fff" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 }
 PHP
 
@@ -931,6 +1035,7 @@ function render_post(string $body): string {
   $html = preg_replace('/`([^`]+)`/u', '<code style="background:var(--bg2);padding:1px 5px;border-radius:4px">$1</code>', $html);
   $html = preg_replace('/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/u', '<a href="$2" rel="noopener nofollow" target="_blank">$1</a>', $html);
   $html = preg_replace('/@([A-Za-z0-9_\-]{3,32})/u', '<a href="/user.php?u=$1" style="background:var(--accent-500);color:#fff;padding:1px 6px;border-radius:4px;font-size:.85em">@$1</a>', $html);
+  $html = preg_replace('/!\[([^\]]*)\]\((\/media\.php\?f=[a-f0-9]{32}\.(?:jpg|png|gif|webp))\)/u', '<img src="$2" alt="$1" loading="lazy" style="max-width:100%;border-radius:.5rem;display:block;margin:.5rem 0">', $html);
   return $html;
 }
 PHP
@@ -1012,6 +1117,340 @@ PHP
 }
 
 write_views() {
+  cat > "$APP_DIR/app/crypto.php" <<'PHP'
+<?php
+declare(strict_types=1);
+// AES-256-GCM helpers for secrets stored in the settings table.
+// Format: v1:base64(iv[12] . tag[16] . ciphertext)
+function secret_key(string $appKey): string {
+    return hash('sha256', $appKey, true);
+}
+function secret_encrypt(string $plain, string $appKey): string {
+    $iv = random_bytes(12);
+    $tag = '';
+    $ct = openssl_encrypt($plain, 'aes-256-gcm', secret_key($appKey), OPENSSL_RAW_DATA, $iv, $tag, '', 16);
+    if ($ct === false) throw new RuntimeException('encrypt failed');
+    return 'v1:' . base64_encode($iv . $tag . $ct);
+}
+function secret_decrypt(string $stored, string $appKey): ?string {
+    if (!str_starts_with($stored, 'v1:')) return null;
+    $raw = base64_decode(substr($stored, 3), true);
+    if ($raw === false || strlen($raw) < 29) return null;
+    $iv = substr($raw, 0, 12);
+    $tag = substr($raw, 12, 16);
+    $ct = substr($raw, 28);
+    $pt = openssl_decrypt($ct, 'aes-256-gcm', secret_key($appKey), OPENSSL_RAW_DATA, $iv, $tag);
+    return $pt === false ? null : $pt;
+}
+PHP
+
+  cat > "$APP_DIR/app/turnstile.php" <<'PHP'
+<?php
+declare(strict_types=1);
+// Cloudflare Turnstile. Fails closed: when enabled, a missing secret or failed check blocks the form.
+function turnstile_verify(string $secret, string $token, string $ip = ''): bool {
+    if ($secret === '' || $token === '') return false;
+    $ch = curl_init('https://challenges.cloudflare.com/turnstile/v0/siteverify');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => ['secret' => $secret, 'response' => $token, 'remoteip' => $ip],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $res = curl_exec($ch);
+    curl_close($ch);
+    if (!is_string($res)) return false;
+    $j = json_decode($res, true);
+    return is_array($j) && ($j['success'] ?? false) === true;
+}
+function turnstile_ok(PDO $db, array $config): bool {
+    if (settings_get($db, 'turnstile_enabled', '0') !== '1') return true;
+    $secret = secret_decrypt(settings_get($db, 'turnstile_secret_enc', ''), $config['app_key']) ?? '';
+    return turnstile_verify($secret, (string)($_POST['cf-turnstile-response'] ?? ''), client_ip());
+}
+PHP
+
+  cat > "$APP_DIR/app/upload.php" <<'PHP'
+<?php
+declare(strict_types=1);
+const UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
+const UPLOAD_ALLOWED = [
+    'image/jpeg' => 'jpg',
+    'image/png'  => 'png',
+    'image/gif'  => 'gif',
+    'image/webp' => 'webp',
+];
+function upload_dir(): string {
+    return dirname($GLOBALS['__config']['db_path']) . '/uploads';
+}
+/** Validates an uploaded image and moves it under a random name. Returns [stored_name, mime, size]. */
+function secure_uploaded_file(array $file, string $destDir): array {
+    if (!isset($file['error']) || is_array($file['error'])) throw new RuntimeException('Geçersiz yükleme.');
+    if ($file['error'] !== UPLOAD_ERR_OK) throw new RuntimeException('Dosya yüklenemedi.');
+    if (!is_uploaded_file($file['tmp_name'])) throw new RuntimeException('Geçersiz yükleme.');
+    if ($file['size'] <= 0 || $file['size'] > UPLOAD_MAX_BYTES) throw new RuntimeException('Dosya 5 MB üstünde olamaz.');
+    $mime = (new finfo(FILEINFO_MIME_TYPE))->file($file['tmp_name']) ?: '';
+    if (!isset(UPLOAD_ALLOWED[$mime])) throw new RuntimeException('Yalnızca jpg, png, gif, webp yüklenebilir.');
+    if (@getimagesize($file['tmp_name']) === false) throw new RuntimeException('Dosya bir resim değil.');
+    $name = bin2hex(random_bytes(16)) . '.' . UPLOAD_ALLOWED[$mime];
+    $dest = rtrim($destDir, '/') . '/' . $name;
+    if (!move_uploaded_file($file['tmp_name'], $dest)) throw new RuntimeException('Dosya kaydedilemedi.');
+    chmod($dest, 0640);
+    return [$name, $mime, (int)$file['size']];
+}
+/** Appends a Markdown image to $body when an image was uploaded in the 'image' field. */
+function append_upload(PDO $db, string $body, int $userId): string {
+    if (!isset($_FILES['image']) || ($_FILES['image']['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) return $body;
+    [$name, $mime, $size] = secure_uploaded_file($_FILES['image'], upload_dir());
+    $db->prepare('INSERT INTO uploads(user_id,post_id,stored_name,original_name,mime,size,created_at) VALUES(?,?,?,?,?,?,?)')
+       ->execute([$userId, null, $name, mb_substr(basename((string)$_FILES['image']['name']), 0, 120), $mime, $size, time()]);
+    return rtrim($body) . "\n\n![image](/media.php?f=" . $name . ")";
+}
+PHP
+
+  cat > "$APP_DIR/app/tags.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function tag_slugify(string $name): string {
+    $s = preg_replace('/[^\p{L}\p{N}]+/u', '-', mb_strtolower($name));
+    return trim((string)$s, '-');
+}
+function tag_get_or_create(PDO $db, string $name): int {
+    $slug = tag_slugify($name);
+    if ($slug === '') return 0;
+    $db->prepare('INSERT OR IGNORE INTO tags(name,slug) VALUES(?,?)')->execute([$name, $slug]);
+    $st = $db->prepare('SELECT id FROM tags WHERE slug = ?');
+    $st->execute([$slug]);
+    return (int)$st->fetchColumn();
+}
+/** Saves submitted tag ids that the category allows (max 5). */
+function tags_save(PDO $db, int $topicId, int $catId, array $submitted): void {
+    $st = $db->prepare('SELECT tag_id FROM category_tags WHERE category_id = ?');
+    $st->execute([$catId]);
+    $allowed = array_map('intval', array_column($st->fetchAll(), 'tag_id'));
+    $ins = $db->prepare('INSERT OR IGNORE INTO topic_tags(topic_id,tag_id) VALUES(?,?)');
+    $ids = array_slice(array_unique(array_map('intval', $submitted)), 0, 5);
+    foreach ($ids as $tid) {
+        if (in_array($tid, $allowed, true)) $ins->execute([$topicId, $tid]);
+    }
+}
+/** Tags for many topics at once: [topic_id => [ ['name'=>..,'slug'=>..], ... ]]. */
+function tags_for_topics(PDO $db, array $ids): array {
+    $out = [];
+    if (!$ids) return $out;
+    $ph = implode(',', array_fill(0, count($ids), '?'));
+    $st = $db->prepare("SELECT tt.topic_id, g.name, g.slug FROM topic_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.topic_id IN ($ph) ORDER BY g.name");
+    $st->execute(array_values($ids));
+    foreach ($st->fetchAll() as $r) $out[(int)$r['topic_id']][] = ['name' => $r['name'], 'slug' => $r['slug']];
+    return $out;
+}
+/** Prefix search over tag names using the FTS5 index. */
+function tag_search(PDO $db, string $q): array {
+    $clean = trim((string)preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $q));
+    $terms = preg_split('/\s+/u', $clean, -1, PREG_SPLIT_NO_EMPTY);
+    if (!$terms) return [];
+    $match = implode(' ', array_map(fn($t) => '"' . $t . '"*', array_slice($terms, 0, 5)));
+    try {
+        $st = $db->prepare('SELECT g.name, g.slug FROM tags_fts f JOIN tags g ON g.id = f.rowid WHERE tags_fts MATCH ? ORDER BY bm25(tags_fts) LIMIT 20');
+        $st->execute([$match]);
+        return $st->fetchAll();
+    } catch (PDOException) {
+        return [];
+    }
+}
+PHP
+
+  cat > "$APP_DIR/app/ai.php" <<'PHP'
+<?php
+declare(strict_types=1);
+// AI profile assistant. A human post enqueues a job; app/ai-worker.php (cron, every minute) answers it.
+const AI_SYSTEM_PROMPT = 'Sen LiteForum forumunun yardımcı asistanısın. Konuşmanın bağlamına uygun, kısa ve yararlı bir yanıt yaz. '
+    . 'Yanıtı konu hangi dildeyse o dilde ver. Zararlı, yanıltıcı veya kişisel veri isteyen içerik üretme. Yalnızca yanıt metnini döndür.';
+
+function ai_enqueue(PDO $db, int $topicId, int $postId, int $authorId): void {
+    $aiId = (int)settings_get($db, 'ai_user_id', '0');
+    if (settings_get($db, 'ai_enabled', '0') !== '1' || $aiId <= 0 || $aiId === $authorId) return;
+    $db->prepare("INSERT INTO ai_jobs(topic_id,post_id,status,created_at,updated_at) VALUES(?,?,'queued',?,?)")
+       ->execute([$topicId, $postId, time(), time()]);
+}
+function ai_context(PDO $db, int $topicId): string {
+    $t = $db->prepare('SELECT title FROM topics WHERE id = ?');
+    $t->execute([$topicId]);
+    $title = (string)$t->fetchColumn();
+    $p = $db->prepare('SELECT u.username, p.body FROM posts p JOIN users u ON u.id = p.user_id WHERE p.topic_id = ? AND p.is_deleted = 0 ORDER BY p.created_at DESC LIMIT 8');
+    $p->execute([$topicId]);
+    $out = "Konu başlığı: $title\n\nSon mesajlar:\n";
+    foreach (array_reverse($p->fetchAll()) as $r) {
+        $out .= '@' . $r['username'] . ': ' . mb_substr((string)$r['body'], 0, 1200) . "\n\n";
+    }
+    return $out;
+}
+function ai_call(string $provider, string $model, string $key, string $user): string {
+    if ($provider === 'openai') {
+        $url = 'https://api.openai.com/v1/chat/completions';
+        $headers = ["Authorization: Bearer $key", 'Content-Type: application/json'];
+        $payload = ['model' => $model !== '' ? $model : 'gpt-4o-mini', 'max_tokens' => 800,
+                    'messages' => [['role' => 'system', 'content' => AI_SYSTEM_PROMPT], ['role' => 'user', 'content' => $user]]];
+    } else {
+        $url = 'https://api.anthropic.com/v1/messages';
+        $headers = ["x-api-key: $key", 'anthropic-version: 2023-06-01', 'Content-Type: application/json'];
+        $payload = ['model' => $model !== '' ? $model : 'claude-haiku-4-5', 'max_tokens' => 800,
+                    'system' => AI_SYSTEM_PROMPT, 'messages' => [['role' => 'user', 'content' => $user]]];
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE),
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $res = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if (!is_string($res) || $code !== 200) throw new RuntimeException("API HTTP $code");
+    $j = json_decode($res, true);
+    $text = $provider === 'openai' ? ($j['choices'][0]['message']['content'] ?? '') : ($j['content'][0]['text'] ?? '');
+    $text = trim((string)$text);
+    if ($text === '') throw new RuntimeException('Boş yanıt');
+    return mb_substr($text, 0, 8000);
+}
+/** Processes up to $limit queued jobs. Returns number of posts created. */
+function ai_run_jobs(PDO $db, array $config, int $limit = 5): int {
+    $key = secret_decrypt(settings_get($db, 'ai_api_key_enc', ''), $config['app_key']) ?? '';
+    $provider = settings_get($db, 'ai_provider', 'anthropic');
+    $model = settings_get($db, 'ai_model', '');
+    $aiId = (int)settings_get($db, 'ai_user_id', '0');
+    $jobs = $db->query("SELECT * FROM ai_jobs WHERE status = 'queued' ORDER BY id LIMIT " . (int)$limit)->fetchAll();
+    $done = 0;
+    foreach ($jobs as $j) {
+        $jid = (int)$j['id'];
+        $db->prepare("UPDATE ai_jobs SET status = 'running', updated_at = ? WHERE id = ?")->execute([time(), $jid]);
+        try {
+            if ($key === '') throw new RuntimeException('API anahtarı tanımlı değil');
+            $reply = ai_call($provider, $model, $key, ai_context($db, (int)$j['topic_id']));
+            $db->prepare('INSERT INTO posts(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)')
+               ->execute([(int)$j['topic_id'], $aiId, $reply, time(), time()]);
+            $db->prepare('UPDATE topics SET updated_at = ? WHERE id = ?')->execute([time(), (int)$j['topic_id']]);
+            $db->prepare("UPDATE ai_jobs SET status = 'done', updated_at = ? WHERE id = ?")->execute([time(), $jid]);
+            $done++;
+        } catch (Throwable $ex) {
+            $db->prepare("UPDATE ai_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ?")
+               ->execute([mb_substr($ex->getMessage(), 0, 300), time(), $jid]);
+        }
+    }
+    return $done;
+}
+PHP
+
+  cat > "$APP_DIR/app/admin-actions.php" <<'PHP'
+<?php
+declare(strict_types=1);
+function admin_user_id(PDO $db, string $username): int {
+    $st = $db->prepare('SELECT id FROM users WHERE username = ?');
+    $st->execute([trim($username)]);
+    return (int)$st->fetchColumn();
+}
+/** Handles v4 admin POST actions. Returns true when the action was handled. */
+function admin_extra_action(PDO $db, array $u, array $config, string $action): bool {
+    switch ($action) {
+        case 'save_ai':
+            $prov = (string)($_POST['ai_provider'] ?? '');
+            settings_set($db, 'ai_provider', in_array($prov, ['anthropic', 'openai'], true) ? $prov : 'anthropic');
+            settings_set($db, 'ai_model', mb_substr(trim((string)($_POST['ai_model'] ?? '')), 0, 64));
+            settings_set($db, 'ai_enabled', isset($_POST['ai_enabled']) ? '1' : '0');
+            $key = trim((string)($_POST['ai_api_key'] ?? ''));
+            if ($key !== '') settings_set($db, 'ai_api_key_enc', secret_encrypt($key, $config['app_key']));
+            audit($db, $u, 'ai.settings');
+            flash_set('ok', t('settings_saved'));
+            return true;
+        case 'save_turnstile':
+            settings_set($db, 'turnstile_enabled', isset($_POST['ts_enabled']) ? '1' : '0');
+            settings_set($db, 'turnstile_site_key', mb_substr(trim((string)($_POST['ts_site'] ?? '')), 0, 100));
+            $sec = trim((string)($_POST['ts_secret'] ?? ''));
+            if ($sec !== '') settings_set($db, 'turnstile_secret_enc', secret_encrypt($sec, $config['app_key']));
+            audit($db, $u, 'turnstile.settings');
+            flash_set('ok', t('settings_saved'));
+            return true;
+        case 'set_verified':
+            $id = admin_user_id($db, (string)($_POST['username'] ?? ''));
+            if ($id > 0) {
+                $v = isset($_POST['verified']) ? 1 : 0;
+                $db->prepare('UPDATE users SET is_verified = ? WHERE id = ?')->execute([$v, $id]);
+                audit($db, $u, 'user.verified', 'user', $id, ['verified' => $v]);
+                flash_set('ok', t('saved'));
+            } else {
+                flash_set('err', t('not_found'));
+            }
+            return true;
+        case 'assign_role':
+            $id = admin_user_id($db, (string)($_POST['username'] ?? ''));
+            $rid = (int)($_POST['role_id'] ?? 0);
+            if ($id > 0) {
+                $db->prepare('UPDATE users SET role_id = ? WHERE id = ?')->execute([$rid > 0 ? $rid : null, $id]);
+                audit($db, $u, 'user.role_assign', 'user', $id, ['role_id' => $rid]);
+                flash_set('ok', t('saved'));
+            } else {
+                flash_set('err', t('not_found'));
+            }
+            return true;
+        case 'create_role':
+            $name = mb_substr(trim((string)($_POST['role_name'] ?? '')), 0, 32);
+            $color = (string)($_POST['role_color'] ?? '#6366f1');
+            if (!preg_match('/^#[0-9A-Fa-f]{6}$/', $color)) $color = '#6366f1';
+            $power = max(0, min(99, (int)($_POST['role_power'] ?? 0)));
+            if ($name !== '') {
+                try {
+                    $db->prepare('INSERT INTO roles(name,color_hex,power_level) VALUES(?,?,?)')->execute([$name, $color, $power]);
+                    audit($db, $u, 'role.create', 'role', (int)$db->lastInsertId());
+                    flash_set('ok', t('saved'));
+                } catch (PDOException) {
+                    flash_set('err', t('already_exists'));
+                }
+            }
+            return true;
+        case 'delete_role':
+            $rid = (int)($_POST['role_id'] ?? 0);
+            if ($rid > 0) {
+                $db->prepare('DELETE FROM roles WHERE id = ?')->execute([$rid]);
+                audit($db, $u, 'role.delete', 'role', $rid);
+                flash_set('ok', t('saved'));
+            }
+            return true;
+        case 'set_category_tags':
+            $cid = (int)($_POST['category_id'] ?? 0);
+            if ($cid > 0) {
+                $db->prepare('DELETE FROM category_tags WHERE category_id = ?')->execute([$cid]);
+                $names = array_slice(array_filter(array_map('trim', explode(',', (string)($_POST['tags'] ?? '')))), 0, 10);
+                foreach ($names as $n) {
+                    $tid = tag_get_or_create($db, mb_substr($n, 0, 30));
+                    if ($tid > 0) {
+                        $db->prepare('INSERT OR IGNORE INTO category_tags(category_id,tag_id) VALUES(?,?)')->execute([$cid, $tid]);
+                    }
+                }
+                audit($db, $u, 'category.tags', 'category', $cid);
+                flash_set('ok', t('saved'));
+            }
+            return true;
+    }
+    return false;
+}
+PHP
+
+  cat > "$APP_DIR/app/ai-worker.php" <<'PHP'
+<?php
+declare(strict_types=1);
+// Run by cron as the service user. Not reachable over HTTP.
+if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
+$cfg = require dirname(__DIR__).'/config/config.php';
+ini_set('session.save_path', dirname($cfg['db_path']).'/sessions');
+require __DIR__.'/bootstrap.php';
+$n = ai_run_jobs($db, $config, 5);
+if ($n > 0) echo date('c')." processed $n\n";
+PHP
+
   cat > "$APP_DIR/views/layout.php" <<'PHP'
 <?php /* @var string $content @var string $title */
 $u = auth_user();
@@ -1244,7 +1683,7 @@ PHP
 PHP
 
   cat > "$APP_DIR/views/category.php" <<'PHP'
-<?php /* @var array $cat @var array $topics @var int $page @var int $total */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
+<?php /* @var array $cat @var array $topics @var int $page @var int $total @var string $tagSlug @var string $tagq @var array $tagsByTopic @var array $allCatTags @var array $tagHits */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
 <div class="breadcrumb">
   <a href="/"><?= e(t('home')) ?></a> <span>›</span> <span><?= e(cat_name($cat, $lc)) ?></span>
 </div>
@@ -1258,6 +1697,28 @@ PHP
   <p class="muted" style="margin:-.5rem 0 1.25rem"><?= e($desc) ?></p>
 <?php endif; ?>
 
+<?php if (!empty($allCatTags)): ?>
+<div class="flex" style="gap:.4rem;flex-wrap:wrap;margin:0 0 1rem">
+  <a href="/category.php?slug=<?= e($cat['slug']) ?>" class="pill<?= $tagSlug === '' ? ' pill-accent' : '' ?>">Tümü</a>
+  <?php foreach ($allCatTags as $tg): ?>
+    <a href="/category.php?slug=<?= e($cat['slug']) ?>&amp;tag=<?= e(rawurlencode($tg['slug'])) ?>" class="pill<?= $tagSlug === $tg['slug'] ? ' pill-accent' : '' ?>">#<?= e($tg['name']) ?></a>
+  <?php endforeach; ?>
+</div>
+<?php endif; ?>
+<form method="get" action="/category.php" class="flex" style="gap:.5rem;margin-bottom:1rem;flex-wrap:wrap">
+  <input type="hidden" name="slug" value="<?= e($cat['slug']) ?>">
+  <input name="tq" value="<?= e($tagq) ?>" placeholder="Etiket ara..." maxlength="40" style="max-width:240px">
+  <button class="btn-ghost btn btn-sm" type="submit"><?= e(t('search')) ?></button>
+</form>
+<?php if ($tagq !== ''): ?>
+  <div class="flex" style="gap:.4rem;flex-wrap:wrap;margin-bottom:1rem">
+    <?php if (empty($tagHits)): ?><span class="muted text-sm"><?= e(t('no_results')) ?></span><?php endif; ?>
+    <?php foreach ($tagHits as $h): ?>
+      <a href="/category.php?slug=<?= e($cat['slug']) ?>&amp;tag=<?= e(rawurlencode($h['slug'])) ?>" class="pill">#<?= e($h['name']) ?></a>
+    <?php endforeach; ?>
+  </div>
+<?php endif; ?>
+
 <div class="glass">
   <?php if (empty($topics)): ?>
     <div class="card muted" style="text-align:center"><?= e(t('no_topics_yet')) ?></div>
@@ -1269,9 +1730,12 @@ PHP
           <?php if ((int)$t['is_pinned']): ?><span class="pill pill-accent">📌</span><?php endif; ?>
           <?php if ((int)$t['is_locked']): ?><span class="pill">🔒</span><?php endif; ?>
           <?= e($t['title']) ?>
+          <?php foreach (($tagsByTopic[(int)$t['id']] ?? []) as $tg): ?>
+            <span class="pill" style="font-size:.7rem">#<?= e($tg['name']) ?></span>
+          <?php endforeach; ?>
         </div>
         <div class="meta">
-          <span>@<?= e($t['username']) ?></span>
+          <span>@<?= e($t['username']) ?></span><?= verified_badge((int)($t['is_verified'] ?? 0)) ?>
           <span>· <?= time_ago((int)$t['updated_at']) ?></span>
           <span>· <?= (int)$t['views'] ?> <?= e(t('views')) ?></span>
         </div>
@@ -1285,8 +1749,9 @@ PHP
 <?php if (($total ?? 0) > 25): ?>
   <div class="flex" style="justify-content:center;margin-top:1.5rem;gap:.5rem">
     <?php $totalPages = (int)ceil($total / 25);
+    $tagParam = $tagSlug !== '' ? '&amp;tag=' . e(rawurlencode($tagSlug)) : '';
     for ($i=1; $i<=$totalPages; $i++): ?>
-      <a href="?slug=<?= e($cat['slug']) ?>&page=<?= $i ?>" class="<?= $i===$page?'btn':'btn-ghost btn' ?>" style="padding:.4rem .8rem;font-size:.85rem"><?= $i ?></a>
+      <a href="?slug=<?= e($cat['slug']) ?>&amp;page=<?= $i ?><?= $tagParam ?>" class="<?= $i===$page?'btn':'btn-ghost btn' ?>" style="padding:.4rem .8rem;font-size:.85rem"><?= $i ?></a>
     <?php endfor; ?>
   </div>
 <?php endif; ?>
@@ -1305,9 +1770,10 @@ PHP
     <?php if ((int)$topic['is_locked']): ?><span class="pill">🔒</span><?php endif; ?>
     <?= e($topic['title']) ?>
   </h1>
+  <?php if (!empty($topicTags)): ?><div class="flex" style="gap:.35rem;flex-wrap:wrap;margin:-.25rem 0 .6rem"><?php foreach ($topicTags as $tg): ?><a class="pill" href="/category.php?slug=<?= e($topic['cat_slug']) ?>&amp;tag=<?= e(rawurlencode($tg['slug'])) ?>">#<?= e($tg['name']) ?></a><?php endforeach; ?></div><?php endif; ?>
   <div class="flex muted" style="font-size:.85rem;flex-wrap:wrap">
     <?= user_avatar($topic['username'], '#6366f1', 24) ?>
-    <span>@<?= e($topic['username']) ?></span>
+    <span>@<?= e($topic['username']) ?></span><?= verified_badge((int)($topic['is_verified'] ?? 0)) ?>
     <span>· <?= date('Y-m-d H:i', (int)$topic['created_at']) ?></span>
     <span>· <?= (int)$topic['views'] ?> <?= e(t('views')) ?></span>
   </div>
@@ -1353,7 +1819,8 @@ PHP
   <div class="post-card" style="<?= (int)$p['is_deleted']?'opacity:.5':'' ?>">
     <div class="head">
       <?= user_avatar($p['username'], $p['avatar_color'] ?? '#6366f1', 28) ?>
-      <span class="author">@<?= e($p['username']) ?></span>
+      <span class="author">@<?= e($p['username']) ?></span><?= verified_badge((int)($p['is_verified'] ?? 0)) ?>
+      <?php if (!empty($p['role_name'])): ?><span class="pill" style="background:<?= e($p['role_color']) ?>;color:#fff;font-size:.7rem"><?= e($p['role_name']) ?></span><?php endif; ?>
       <span class="time">· <?= time_ago((int)$p['created_at']) ?></span>
       <?php if (!empty($p['edited_at'])): ?><span class="time">· <?= e(t('edited')) ?></span><?php endif; ?>
     </div>
@@ -1401,8 +1868,9 @@ PHP
 <?php if ($u && empty($topic['is_locked'])): ?>
 <div class="glass card" style="margin-top:1.5rem">
   <h2 style="margin:0 0 1rem;font-size:1.15rem"><?= e(t('reply')) ?></h2>
-  <form method="post" action="/topic.php?id=<?= (int)$topic['id'] ?>" class="grid">
+  <form method="post" action="/topic.php?id=<?= (int)$topic['id'] ?>" class="grid" enctype="multipart/form-data">
     <?= csrf_field() ?><input type="hidden" name="action" value="reply">
+    <label class="text-sm muted">Resim (jpg, png, gif, webp; en fazla 5 MB)<input type="file" name="image" accept="image/jpeg,image/png,image/gif,image/webp"></label>
     <textarea name="body" rows="6" required placeholder="**bold** *italic* `code` [link](url) @user &gt; quote"></textarea>
     <button type="submit"><?= e(t('submit')) ?></button>
   </form>
@@ -1415,7 +1883,7 @@ PHP
 PHP
 
   cat > "$APP_DIR/views/new-topic.php" <<'PHP'
-<?php /* @var array $cat @var string $error */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
+<?php /* @var array $cat @var string $error @var array $allowedTags */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
 <div class="breadcrumb">
   <a href="/"><?= e(t('home')) ?></a> <span>›</span>
   <a href="/category.php?slug=<?= e($cat['slug']) ?>"><?= e(cat_name($cat, $lc)) ?></a> <span>›</span>
@@ -1424,10 +1892,19 @@ PHP
 <div class="glass card" style="max-width:720px;margin:0 auto">
   <h1 style="margin:0 0 1.25rem;font-size:1.5rem"><?= e(t('new_topic')) ?></h1>
   <?php if (!empty($error)): ?><div class="flash flash-err"><?= e($error) ?></div><?php endif; ?>
-  <form method="post" class="grid">
+  <form method="post" class="grid" enctype="multipart/form-data">
     <?= csrf_field() ?>
     <input name="title" required minlength="3" maxlength="200" placeholder="<?= e(t('title')) ?>">
     <textarea name="body" rows="10" required placeholder="<?= e(t('body')) ?>"></textarea>
+    <?php if (!empty($allowedTags)): ?>
+    <fieldset style="border:1px solid var(--border);border-radius:.5rem;padding:.6rem .8rem">
+      <legend class="muted text-sm">Etiketler (en fazla 5)</legend>
+      <?php foreach ($allowedTags as $tg): ?>
+        <label class="pill" style="cursor:pointer;margin:.2rem"><input type="checkbox" name="tags[]" value="<?= (int)$tg['id'] ?>"> #<?= e($tg['name']) ?></label>
+      <?php endforeach; ?>
+    </fieldset>
+    <?php endif; ?>
+    <label class="text-sm muted">Resim (jpg, png, gif, webp; en fazla 5 MB)<input type="file" name="image" accept="image/jpeg,image/png,image/gif,image/webp"></label>
     <button type="submit"><?= e(t('submit')) ?></button>
   </form>
 </div>
@@ -1442,6 +1919,10 @@ PHP
     <?= csrf_field() ?>
     <input name="email" type="email" required placeholder="<?= e(t('email')) ?>" autocomplete="username">
     <input name="password" type="password" required placeholder="<?= e(t('password')) ?>" autocomplete="current-password">
+    <?php if (!empty($GLOBALS['__turnstile_site'])): ?>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <div class="cf-turnstile" data-sitekey="<?= e($GLOBALS['__turnstile_site']) ?>" style="margin-bottom:.75rem"></div>
+    <?php endif; ?>
     <button type="submit"><?= e(t('login')) ?></button>
   </form>
   <?php $showErenDev = (($config['default_lang'] ?? '') === 'tr') && (($_SESSION['ui_lang'] ?? '') === 'tr');
@@ -1477,6 +1958,10 @@ PHP
     <input name="email" type="email" required placeholder="<?= e(t('email')) ?>">
     <input name="password" type="password" required minlength="10" placeholder="<?= e(t('password')) ?> (min 10)">
     <input name="hp" type="text" tabindex="-1" style="display:none">
+    <?php if (!empty($GLOBALS['__turnstile_site'])): ?>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <div class="cf-turnstile" data-sitekey="<?= e($GLOBALS['__turnstile_site']) ?>" style="margin-bottom:.75rem"></div>
+    <?php endif; ?>
     <button type="submit"><?= e(t('register')) ?></button>
   </form>
   <?php $showErenDev = (($config['default_lang'] ?? '') === 'tr') && (($_SESSION['ui_lang'] ?? '') === 'tr');
@@ -1642,7 +2127,7 @@ PHP
 <div class="glass card" style="margin-bottom:1.25rem;display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap">
   <div class="avatar-lg" style="background:linear-gradient(135deg,<?= e($profile['avatar_color']) ?>,<?= e($profile['avatar_color']) ?>99)"><?= e(mb_strtoupper(mb_substr($profile['username'],0,1))) ?></div>
   <div style="flex:1;min-width:200px">
-    <h1 style="margin:0 0 .35rem;font-size:1.75rem">@<?= e($profile['username']) ?></h1>
+    <h1 style="margin:0 0 .35rem;font-size:1.75rem">@<?= e($profile['username']) ?><?= verified_badge((int)($profile['is_verified'] ?? 0)) ?></h1>
     <?php if ($profile['bio']): ?><p class="muted" style="margin:0 0 .5rem"><?= e($profile['bio']) ?></p><?php endif; ?>
     <div class="flex flex-wrap muted" style="font-size:.85rem;gap:1rem">
       <span><span class="pill"><?= e($profile['role']) ?></span></span>
@@ -1762,6 +2247,88 @@ PHP
   cat > "$APP_DIR/views/admin.php" <<'PHP'
 <?php /* @var array $users @var array $audit @var array $cats @var string $appName @var string $appTagline */ $lc = $_SESSION['ui_lang'] ?? 'tr'; ?>
 <h1 style="margin:0 0 1.5rem;font-size:1.75rem">Admin</h1>
+
+<div class="glass card" style="margin-bottom:1.5rem">
+  <h2 style="margin:0 0 1rem;font-size:1.2rem">Yapay Zeka Asistanı</h2>
+  <form method="post" action="/admin.php" class="grid">
+    <?= csrf_field() ?><input type="hidden" name="action" value="save_ai">
+    <label class="text-sm"><input type="checkbox" name="ai_enabled" value="1" <?= settings_get($db,'ai_enabled','0') === '1' ? 'checked' : '' ?>> Etkin</label>
+    <select name="ai_provider">
+      <?php $prov = settings_get($db,'ai_provider','anthropic'); foreach (['anthropic'=>'Anthropic','openai'=>'OpenAI'] as $k => $lbl): ?>
+        <option value="<?= e($k) ?>" <?= $prov === $k ? 'selected' : '' ?>><?= e($lbl) ?></option>
+      <?php endforeach; ?>
+    </select>
+    <input name="ai_model" maxlength="64" value="<?= e(settings_get($db,'ai_model','')) ?>" placeholder="Model (boş = varsayılan)">
+    <input name="ai_api_key" type="password" autocomplete="new-password" placeholder="<?= settings_get($db,'ai_api_key_enc','') !== '' ? 'API key kayıtlı (değiştirmek için yazın)' : 'API key' ?>">
+    <button type="submit"><?= e(t('save')) ?></button>
+  </form>
+  <p class="muted text-sm" style="margin-top:.75rem">Key, app_key ile AES-256-GCM şifrelenerek saklanır. Yanıtlar her dakika çalışan worker ile üretilir.</p>
+</div>
+
+<div class="glass card" style="margin-bottom:1.5rem">
+  <h2 style="margin:0 0 1rem;font-size:1.2rem">Cloudflare Turnstile</h2>
+  <form method="post" action="/admin.php" class="grid">
+    <?= csrf_field() ?><input type="hidden" name="action" value="save_turnstile">
+    <label class="text-sm"><input type="checkbox" name="ts_enabled" value="1" <?= settings_get($db,'turnstile_enabled','0') === '1' ? 'checked' : '' ?>> Kayıt ve girişte etkin</label>
+    <input name="ts_site" maxlength="100" value="<?= e(settings_get($db,'turnstile_site_key','')) ?>" placeholder="Site key">
+    <input name="ts_secret" type="password" autocomplete="new-password" placeholder="<?= settings_get($db,'turnstile_secret_enc','') !== '' ? 'Secret kayıtlı (değiştirmek için yazın)' : 'Secret key' ?>">
+    <button type="submit"><?= e(t('save')) ?></button>
+  </form>
+  <p class="muted text-sm" style="margin-top:.75rem">Etkinken secret tanımlı değilse giriş ve kayıt engellenir.</p>
+</div>
+
+<div class="glass card" style="margin-bottom:1.5rem">
+  <h2 style="margin:0 0 1rem;font-size:1.2rem">Doğrulanmış hesap ve roller</h2>
+  <form method="post" action="/admin.php" class="flex" style="gap:.5rem;flex-wrap:wrap">
+    <?= csrf_field() ?><input type="hidden" name="action" value="set_verified">
+    <input name="username" required placeholder="<?= e(t('username')) ?>">
+    <label class="text-sm"><input type="checkbox" name="verified" value="1"> Doğrulanmış</label>
+    <button type="submit"><?= e(t('save')) ?></button>
+  </form>
+  <form method="post" action="/admin.php" class="flex" style="gap:.5rem;flex-wrap:wrap;margin-top:1rem">
+    <?= csrf_field() ?><input type="hidden" name="action" value="assign_role">
+    <input name="username" required placeholder="<?= e(t('username')) ?>">
+    <select name="role_id">
+      <option value="0">Rol yok</option>
+      <?php foreach ($roles as $r): ?><option value="<?= (int)$r['id'] ?>"><?= e($r['name']) ?></option><?php endforeach; ?>
+    </select>
+    <button type="submit">Ata</button>
+  </form>
+  <div class="flex" style="gap:.5rem;flex-wrap:wrap;margin-top:1rem">
+    <?php foreach ($roles as $r): ?>
+      <span class="pill" style="background:<?= e($r['color_hex']) ?>;color:#fff"><?= e($r['name']) ?> (<?= (int)$r['power_level'] ?>)</span>
+      <form method="post" action="/admin.php" style="margin:0" data-confirm="<?= e(t('delete_confirm')) ?>">
+        <?= csrf_field() ?><input type="hidden" name="action" value="delete_role"><input type="hidden" name="role_id" value="<?= (int)$r['id'] ?>">
+        <button class="btn-danger btn btn-sm" type="submit">🗑</button>
+      </form>
+    <?php endforeach; ?>
+  </div>
+  <form method="post" action="/admin.php" class="flex" style="gap:.5rem;flex-wrap:wrap;margin-top:1rem">
+    <?= csrf_field() ?><input type="hidden" name="action" value="create_role">
+    <input name="role_name" maxlength="32" required placeholder="Rol adı">
+    <input name="role_color" type="color" value="#6366f1">
+    <input name="role_power" type="number" min="0" max="99" value="0" style="width:90px" title="50+ moderatör yetkisi">
+    <button type="submit"><?= e(t('add_category')) ?></button>
+  </form>
+  <p class="muted text-sm" style="margin-top:.5rem">Yetki seviyesi 50 ve üzeri moderatör yetkisi verir. Özel rollerle yönetici yetkisi verilemez.</p>
+</div>
+
+<div class="glass card" style="margin-bottom:1.5rem">
+  <h2 style="margin:0 0 1rem;font-size:1.2rem">Pano etiketleri</h2>
+  <?php foreach ($cats as $c):
+    $tq = $db->prepare('SELECT g.name FROM category_tags ct JOIN tags g ON g.id = ct.tag_id WHERE ct.category_id = ? ORDER BY g.name');
+    $tq->execute([(int)$c['id']]);
+    $names = array_column($tq->fetchAll(), 'name');
+  ?>
+    <form method="post" action="/admin.php" class="flex" style="gap:.5rem;margin-bottom:.5rem;flex-wrap:wrap">
+      <?= csrf_field() ?><input type="hidden" name="action" value="set_category_tags"><input type="hidden" name="category_id" value="<?= (int)$c['id'] ?>">
+      <strong style="min-width:140px"><?= e($c['icon']) ?> <?= e($c['name_tr']) ?></strong>
+      <input name="tags" value="<?= e(implode(', ', $names)) ?>" placeholder="yazılım, rehber, hobi" style="flex:1;min-width:200px">
+      <button class="btn-ghost btn btn-sm" type="submit"><?= e(t('save')) ?></button>
+    </form>
+  <?php endforeach; ?>
+</div>
+
 
 <div class="glass card" style="margin-bottom:1.5rem">
   <h2 style="margin:0 0 1rem;font-size:1.2rem"><?= e(t('admin_settings')) ?></h2>
@@ -1957,7 +2524,8 @@ require dirname(__DIR__).'/app/bootstrap.php';
 $error='';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
-  if (!rate_limit($db,'login',client_ip(),$config['rate_limit']['login_per_10min'],600)) {
+  if (!turnstile_ok($db,$config)) { $error = t('bot_detected'); }
+  elseif (!rate_limit($db,'login',client_ip(),$config['rate_limit']['login_per_10min'],600)) {
     http_response_code(429); $error=t('too_many_attempts');
   } else {
     $email = filter_var($_POST['email']??'', FILTER_VALIDATE_EMAIL);
@@ -1984,7 +2552,8 @@ $error='';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
   if (!empty($_POST['hp'])) { http_response_code(400); exit(t('bot_detected')); }
-  if (!rate_limit($db,'register',client_ip(),$config['rate_limit']['register_per_hr'],3600)) {
+  if (!turnstile_ok($db,$config)) { $error = t('bot_detected'); }
+  elseif (!rate_limit($db,'register',client_ip(),$config['rate_limit']['register_per_hr'],3600)) {
     http_response_code(429); $error=t('register_limit');
   } else {
     $u=trim((string)($_POST['username']??''));
@@ -2081,15 +2650,29 @@ $st->execute([$slug]); $cat = $st->fetch();
 if (!$cat) { http_response_code(404); require LF_ROOT.'/views/404.php'; exit; }
 $page = max(1, (int)($_GET['page'] ?? 1));
 $per = 25; $off = ($page - 1) * $per;
-$cnt = $db->prepare('SELECT COUNT(*) FROM topics WHERE category_id=?'); $cnt->execute([(int)$cat['id']]);
+$tagSlug = trim((string)($_GET['tag'] ?? ''));
+$tagq = trim((string)($_GET['tq'] ?? ''));
+$where = 't.category_id = ?';
+$args = [(int)$cat['id']];
+if ($tagSlug !== '') {
+  $where .= ' AND t.id IN (SELECT tt.topic_id FROM topic_tags tt JOIN tags g ON g.id = tt.tag_id WHERE g.slug = ?)';
+  $args[] = $tagSlug;
+}
+$cnt = $db->prepare("SELECT COUNT(*) FROM topics t WHERE $where");
+$cnt->execute($args);
 $total = (int)$cnt->fetchColumn();
 $tst = $db->prepare(
-  'SELECT t.*, u.username, u.avatar_color, (SELECT COUNT(*) FROM posts p WHERE p.topic_id = t.id AND p.is_deleted=0) AS post_count
+  "SELECT t.*, u.username, u.avatar_color, u.is_verified,
+          (SELECT COUNT(*) FROM posts p WHERE p.topic_id = t.id AND p.is_deleted=0) AS post_count
    FROM topics t JOIN users u ON u.id = t.user_id
-   WHERE t.category_id = ? ORDER BY t.is_pinned DESC, t.updated_at DESC LIMIT ? OFFSET ?'
+   WHERE $where ORDER BY t.is_pinned DESC, t.updated_at DESC LIMIT ? OFFSET ?"
 );
-$tst->execute([(int)$cat['id'], $per, $off]);
+$tst->execute(array_merge($args, [$per, $off]));
 $topics = $tst->fetchAll();
+$tagsByTopic = tags_for_topics($db, array_map(fn($x) => (int)$x['id'], $topics));
+$ctg = $db->prepare('SELECT g.name, g.slug FROM category_tags ct JOIN tags g ON g.id = ct.tag_id WHERE ct.category_id = ? ORDER BY g.name');
+$ctg->execute([(int)$cat['id']]); $allCatTags = $ctg->fetchAll();
+$tagHits = $tagq !== '' ? tag_search($db, $tagq) : [];
 $title = cat_name($cat, $_SESSION['ui_lang'] ?? 'tr');
 ob_start(); require LF_ROOT.'/views/category.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
@@ -2101,7 +2684,7 @@ declare(strict_types=1);
 require dirname(__DIR__).'/app/bootstrap.php';
 $id = (int)($_GET['id'] ?? 0);
 if ($id <= 0) { http_response_code(400); exit('Missing id'); }
-$tst = $db->prepare('SELECT t.*, u.username, c.slug AS cat_slug FROM topics t JOIN users u ON u.id=t.user_id JOIN categories c ON c.id=t.category_id WHERE t.id=?');
+$tst = $db->prepare('SELECT t.*, u.username, u.is_verified, c.slug AS cat_slug FROM topics t JOIN users u ON u.id=t.user_id JOIN categories c ON c.id=t.category_id WHERE t.id=?');
 $tst->execute([$id]); $topic = $tst->fetch();
 if (!$topic) { http_response_code(404); require LF_ROOT.'/views/404.php'; exit; }
 $skey = 'viewed_' . $id;
@@ -2130,6 +2713,8 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && $u) {
     }
   } elseif ($action === 'reply' && empty($topic['is_locked'])) {
     $body = trim((string)($_POST['body'] ?? ''));
+    try { $body = append_upload($db, $body, (int)$u['id']); }
+    catch (RuntimeException $ex) { flash_set('err', $ex->getMessage()); $body = ''; }
     if ($body !== '' && rate_limit($db,'post',client_ip(),$config['rate_limit']['post_per_min'],60)) {
       $db->prepare('INSERT INTO posts(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)')
          ->execute([$id, (int)$u['id'], $body, time(), time()]);
@@ -2137,12 +2722,13 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && $u) {
       $db->prepare('UPDATE topics SET updated_at=? WHERE id=?')->execute([time(), $id]);
       notif_for_mentions($db, $body, $id, $newPostId, (int)$u['id']);
       notif_for_replies($db, $id, $newPostId, (int)$u['id'], $body);
+      ai_enqueue($db, $id, $newPostId, (int)$u['id']);
     }
   }
   redirect('/topic.php?id='.$id);
 }
 
-$pst = $db->prepare('SELECT p.*, u.username, u.avatar_color FROM posts p JOIN users u ON u.id=p.user_id WHERE p.topic_id=? ORDER BY p.created_at ASC');
+$pst = $db->prepare('SELECT p.*, u.username, u.avatar_color, u.is_verified, r.name AS role_name, r.color_hex AS role_color FROM posts p JOIN users u ON u.id=p.user_id LEFT JOIN roles r ON r.id = u.role_id WHERE p.topic_id=? ORDER BY p.created_at ASC');
 $pst->execute([$id]); $posts = $pst->fetchAll();
 
 $reactions = [];
@@ -2165,6 +2751,8 @@ if ($u) {
   $w = $db->prepare('SELECT 1 FROM topic_watches WHERE user_id=? AND topic_id=?');
   $w->execute([(int)$u['id'], $id]); $watching = (bool)$w->fetchColumn();
 }
+$tgs = $db->prepare('SELECT g.name, g.slug FROM topic_tags tt JOIN tags g ON g.id = tt.tag_id WHERE tt.topic_id = ? ORDER BY g.name');
+$tgs->execute([$id]); $topicTags = $tgs->fetchAll();
 $title = $topic['title'];
 ob_start(); require LF_ROOT.'/views/topic.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
@@ -2187,15 +2775,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
   if (strlen($title) < 3 || $body === '') $error = 'Başlık ve içerik gerekli.';
   elseif (!rate_limit($db,'post',client_ip(),$config['rate_limit']['post_per_min'],60)) $error = 'Çok hızlı. Biraz bekleyin.';
   else {
-    $slug = preg_replace('/[^a-z0-9]+/', '-', strtolower($title));
-    $db->prepare('INSERT INTO topics(category_id,user_id,title,slug,created_at,updated_at) VALUES(?,?,?,?,?,?)')
-       ->execute([$catId, (int)$u['id'], $title, $slug, time(), time()]);
-    $tid = (int)$db->lastInsertId();
-    $db->prepare('INSERT INTO posts(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)')
-       ->execute([$tid, (int)$u['id'], $body, time(), time()]);
-    redirect('/topic.php?id='.$tid);
+    try { $body = append_upload($db, $body, (int)$u['id']); }
+    catch (RuntimeException $ex) { $error = $ex->getMessage(); }
+    if ($error === '') {
+      $slug = preg_replace('/[^a-z0-9]+/', '-', strtolower($title));
+      $db->prepare('INSERT INTO topics(category_id,user_id,title,slug,created_at,updated_at) VALUES(?,?,?,?,?,?)')
+         ->execute([$catId, (int)$u['id'], $title, $slug, time(), time()]);
+      $tid = (int)$db->lastInsertId();
+      $db->prepare('INSERT INTO posts(topic_id,user_id,body,created_at,updated_at) VALUES(?,?,?,?,?)')
+         ->execute([$tid, (int)$u['id'], $body, time(), time()]);
+      $newPostId = (int)$db->lastInsertId();
+      tags_save($db, $tid, $catId, array_map('intval', (array)($_POST['tags'] ?? [])));
+      ai_enqueue($db, $tid, $newPostId, (int)$u['id']);
+      redirect('/topic.php?id='.$tid);
+    }
   }
 }
+$tgq = $db->prepare('SELECT g.id, g.name FROM category_tags ct JOIN tags g ON g.id = ct.tag_id WHERE ct.category_id = ? ORDER BY g.name');
+$tgq->execute([$catId]); $allowedTags = $tgq->fetchAll();
 $title = t('new_topic');
 ob_start(); require LF_ROOT.'/views/new-topic.php'; $content = ob_get_clean();
 require LF_ROOT.'/views/layout.php';
@@ -2429,6 +3026,7 @@ $u = auth_admin();
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   csrf_verify();
   $action = $_POST['action'] ?? '';
+  if (admin_extra_action($db, $u, $config, $action)) { redirect('/admin.php'); }
   if ($action === 'bulk_role') {
     $ids = array_filter(array_map('intval', explode(',', $_POST['ids'] ?? '')));
     $role = in_array($_POST['role'] ?? '', ['member','moderator','admin'], true) ? $_POST['role'] : 'member';
@@ -2495,6 +3093,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 $users = $db->query('SELECT id,username,email,role,banned FROM users ORDER BY id DESC LIMIT 200')->fetchAll();
 $cats  = $db->query('SELECT * FROM categories ORDER BY position, id')->fetchAll();
 $audit = $db->query('SELECT a.*, u.username AS actor FROM audit_log a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.ts DESC LIMIT 50')->fetchAll();
+$roles = $db->query('SELECT * FROM roles ORDER BY power_level DESC, id')->fetchAll();
 $appName = $GLOBALS['__app_name'];
 $appTagline = $GLOBALS['__app_tagline'];
 $title = 'Admin';
@@ -2553,6 +3152,24 @@ if ((int)$user['banned'] === 1) { http_response_code(403); exit(t('banned_msg'))
 auth_login($user); redirect('/');
 PHP
 
+  cat > "$APP_DIR/public/media.php" <<'PHP'
+<?php
+declare(strict_types=1);
+require dirname(__DIR__).'/app/bootstrap.php';
+$f = (string)($_GET['f'] ?? '');
+if (!preg_match('/^[a-f0-9]{32}\.(jpg|png|gif|webp)$/', $f)) { http_response_code(404); exit; }
+$st = $db->prepare('SELECT mime FROM uploads WHERE stored_name = ?');
+$st->execute([$f]);
+$mime = $st->fetchColumn();
+$path = upload_dir().'/'.$f;
+if (!$mime || !is_file($path)) { http_response_code(404); exit; }
+header('Content-Type: '.$mime);
+header('Content-Length: '.filesize($path));
+header('X-Content-Type-Options: nosniff');
+header('Cache-Control: public, max-age=31536000, immutable');
+readfile($path);
+PHP
+
   cat > "$APP_DIR/public/404.php" <<'PHP'
 <?php
 declare(strict_types=1);
@@ -2609,7 +3226,7 @@ server {
   add_header X-Frame-Options "DENY" always;
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
+  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
   location = /favicon.ico { access_log off; return 204; }
   location = /login.php { limit_req zone=lf_login burst=5 nodelay; fastcgi_pass unix:$SOCK; include fastcgi_params; fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name; fastcgi_param HTTP_PROXY ""; }
   location ~ \.php\$ {
@@ -2638,7 +3255,7 @@ $IPV6_LINE
   root $APP_DIR/public; index index.php;
   server_tokens off; charset utf-8;
   client_max_body_size 10m;
-  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
+  add_header Content-Security-Policy "default-src 'self'; img-src 'self' https://oauth2.erendev.xyz data:; style-src 'self' 'unsafe-inline'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://oauth2.erendev.xyz" always;
   add_header X-Frame-Options "DENY" always;
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "strict-origin-when-cross-origin" always;
@@ -2688,6 +3305,8 @@ php_admin_flag[display_errors] = off
 php_admin_flag[expose_php] = off
 php_admin_flag[allow_url_include] = off
 php_admin_value[open_basedir] = $APP_DIR:$DATA_DIR:/tmp:/var/log/liteforum
+php_admin_value[upload_max_filesize] = 6M
+php_admin_value[post_max_size] = 8M
 php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,show_source,phpinfo
 php_admin_value[upload_tmp_dir] = $DATA_DIR/tmp
 php_admin_value[session.save_path] = $DATA_DIR/sessions
@@ -3032,6 +3651,7 @@ create_user
 create_dirs
 gen_secrets
 init_sqlite
+migrate_v4
 write_env
 write_i18n
 write_app
@@ -3043,6 +3663,7 @@ setup_fail2ban
 setup_sysctl
 seed_data
 setup_backups
+setup_ai_cron
 setup_tls
 write_nginx
 start_services
@@ -3073,7 +3694,7 @@ OAuth secret    : $OAuth_CLIENT_SECRET
 DB              : $DATA_DIR/liteforum.db
 Logs            : $LOG_DIR
 
-Features (v3 — all):
+Features (v4):
   ✓ Multi-language UI (tr/en/fr/de/es/ar) — switcher in header
   ✓ Per-user theme + accent color + avatar color
   ✓ Site name + tagline editable from /admin.php
@@ -3091,6 +3712,12 @@ Features (v3 — all):
   ✓ Markdown-lite in posts (bold, italic, code, links, quotes, mentions)
   ✓ Ban enforcement (blocked users cannot log in)
   ✓ Double-gated ErenDev OAuth (install=tr AND ui=tr)
+  ✓ Dynamic roles with colored labels (admin panel)
+  ✓ Verified account badge (admin panel)
+  ✓ Image upload in topics and replies (jpg/png/gif/webp, 5 MB)
+  ✓ Topic tags per category, tag search (FTS5)
+  ✓ Cloudflare Turnstile on login/register (admin panel)
+  ✓ AI profile assistant (AES-256-GCM encrypted API key, cron worker)
 
 Troubleshooting:
   sudo tail -30 /var/log/liteforum/error.log
