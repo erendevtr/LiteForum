@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# LiteForum — Complete One-Shot Installer (v4 — All Features)
+# LiteForum — Complete One-Shot Installer (v4 — All Features, Fixed)
 # =============================================================================
 set -Eeuo pipefail
 umask 027
@@ -61,8 +61,6 @@ if [[ $SKIP_TLS -eq 0 && "$HTTP_PORT" != "80" ]]; then
 fi
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@${DOMAIN}}"; EMAIL="${EMAIL:-$ADMIN_EMAIL}"
 
-# Inputs are interpolated into nginx, PHP, and SQL. Reject anything outside a
-# strict allow-list so a crafted argument cannot break out of those contexts.
 validate_inputs() {
   DOMAIN="${DOMAIN,,}"
   local re_dom='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
@@ -679,7 +677,9 @@ PHP
   'post_too_fast'=>'نشر سريع جدًا.','banned_msg'=>'حسابك محظور.',
 ];
 PHP
-  chown -R root:root "$APP_DIR/lang"; chmod 0644 "$APP_DIR/lang"/*.php
+  chown -R root:root "$APP_DIR/lang"
+  find "$APP_DIR/lang" -type d -exec chmod 0755 {} \;
+  find "$APP_DIR/lang" -type f -exec chmod 0644 {} \;
   ok "i18n"
 }
 
@@ -1112,16 +1112,9 @@ function consume_reset_token(PDO $db, string $token): ?int {
 }
 PHP
 
-  chown -R root:root "$APP_DIR/app"; chmod -R 0755 "$APP_DIR/app"
-  ok "app/"
-}
-
-write_views() {
   cat > "$APP_DIR/app/crypto.php" <<'PHP'
 <?php
 declare(strict_types=1);
-// AES-256-GCM helpers for secrets stored in the settings table.
-// Format: v1:base64(iv[12] . tag[16] . ciphertext)
 function secret_key(string $appKey): string {
     return hash('sha256', $appKey, true);
 }
@@ -1147,7 +1140,6 @@ PHP
   cat > "$APP_DIR/app/turnstile.php" <<'PHP'
 <?php
 declare(strict_types=1);
-// Cloudflare Turnstile. Fails closed: when enabled, a missing secret or failed check blocks the form.
 function turnstile_verify(string $secret, string $token, string $ip = ''): bool {
     if ($secret === '' || $token === '') return false;
     $ch = curl_init('https://challenges.cloudflare.com/turnstile/v0/siteverify');
@@ -1184,7 +1176,6 @@ const UPLOAD_ALLOWED = [
 function upload_dir(): string {
     return dirname($GLOBALS['__config']['db_path']) . '/uploads';
 }
-/** Validates an uploaded image and moves it under a random name. Returns [stored_name, mime, size]. */
 function secure_uploaded_file(array $file, string $destDir): array {
     if (!isset($file['error']) || is_array($file['error'])) throw new RuntimeException('Geçersiz yükleme.');
     if ($file['error'] !== UPLOAD_ERR_OK) throw new RuntimeException('Dosya yüklenemedi.');
@@ -1199,7 +1190,6 @@ function secure_uploaded_file(array $file, string $destDir): array {
     chmod($dest, 0640);
     return [$name, $mime, (int)$file['size']];
 }
-/** Appends a Markdown image to $body when an image was uploaded in the 'image' field. */
 function append_upload(PDO $db, string $body, int $userId): string {
     if (!isset($_FILES['image']) || ($_FILES['image']['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) return $body;
     [$name, $mime, $size] = secure_uploaded_file($_FILES['image'], upload_dir());
@@ -1224,7 +1214,6 @@ function tag_get_or_create(PDO $db, string $name): int {
     $st->execute([$slug]);
     return (int)$st->fetchColumn();
 }
-/** Saves submitted tag ids that the category allows (max 5). */
 function tags_save(PDO $db, int $topicId, int $catId, array $submitted): void {
     $st = $db->prepare('SELECT tag_id FROM category_tags WHERE category_id = ?');
     $st->execute([$catId]);
@@ -1235,7 +1224,6 @@ function tags_save(PDO $db, int $topicId, int $catId, array $submitted): void {
         if (in_array($tid, $allowed, true)) $ins->execute([$topicId, $tid]);
     }
 }
-/** Tags for many topics at once: [topic_id => [ ['name'=>..,'slug'=>..], ... ]]. */
 function tags_for_topics(PDO $db, array $ids): array {
     $out = [];
     if (!$ids) return $out;
@@ -1245,7 +1233,6 @@ function tags_for_topics(PDO $db, array $ids): array {
     foreach ($st->fetchAll() as $r) $out[(int)$r['topic_id']][] = ['name' => $r['name'], 'slug' => $r['slug']];
     return $out;
 }
-/** Prefix search over tag names using the FTS5 index. */
 function tag_search(PDO $db, string $q): array {
     $clean = trim((string)preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $q));
     $terms = preg_split('/\s+/u', $clean, -1, PREG_SPLIT_NO_EMPTY);
@@ -1264,7 +1251,6 @@ PHP
   cat > "$APP_DIR/app/ai.php" <<'PHP'
 <?php
 declare(strict_types=1);
-// AI profile assistant. A human post enqueues a job; app/ai-worker.php (cron, every minute) answers it.
 const AI_SYSTEM_PROMPT = 'Sen LiteForum forumunun yardımcı asistanısın. Konuşmanın bağlamına uygun, kısa ve yararlı bir yanıt yaz. '
     . 'Yanıtı konu hangi dildeyse o dilde ver. Zararlı, yanıltıcı veya kişisel veri isteyen içerik üretme. Yalnızca yanıt metnini döndür.';
 
@@ -1317,7 +1303,6 @@ function ai_call(string $provider, string $model, string $key, string $user): st
     if ($text === '') throw new RuntimeException('Boş yanıt');
     return mb_substr($text, 0, 8000);
 }
-/** Processes up to $limit queued jobs. Returns number of posts created. */
 function ai_run_jobs(PDO $db, array $config, int $limit = 5): int {
     $key = secret_decrypt(settings_get($db, 'ai_api_key_enc', ''), $config['app_key']) ?? '';
     $provider = settings_get($db, 'ai_provider', 'anthropic');
@@ -1353,7 +1338,6 @@ function admin_user_id(PDO $db, string $username): int {
     $st->execute([trim($username)]);
     return (int)$st->fetchColumn();
 }
-/** Handles v4 admin POST actions. Returns true when the action was handled. */
 function admin_extra_action(PDO $db, array $u, array $config, string $action): bool {
     switch ($action) {
         case 'save_ai':
@@ -1442,7 +1426,6 @@ PHP
   cat > "$APP_DIR/app/ai-worker.php" <<'PHP'
 <?php
 declare(strict_types=1);
-// Run by cron as the service user. Not reachable over HTTP.
 if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 $cfg = require dirname(__DIR__).'/config/config.php';
 ini_set('session.save_path', dirname($cfg['db_path']).'/sessions');
@@ -1451,6 +1434,13 @@ $n = ai_run_jobs($db, $config, 5);
 if ($n > 0) echo date('c')." processed $n\n";
 PHP
 
+  chown -R root:root "$APP_DIR/app"
+  find "$APP_DIR/app" -type d -exec chmod 0755 {} \;
+  find "$APP_DIR/app" -type f -exec chmod 0644 {} \;
+  ok "app/"
+}
+
+write_views() {
   cat > "$APP_DIR/views/layout.php" <<'PHP'
 <?php /* @var string $content @var string $title */
 $u = auth_user();
@@ -2476,7 +2466,9 @@ PHP
 </div>
 PHP
 
-  chown -R root:root "$APP_DIR/views"; chmod -R 0755 "$APP_DIR/views"
+  chown -R root:root "$APP_DIR/views"
+  find "$APP_DIR/views" -type d -exec chmod 0755 {} \;
+  find "$APP_DIR/views" -type f -exec chmod 0644 {} \;
   ok "views/"
 }
 
@@ -3141,7 +3133,6 @@ if (!preg_match('/^[A-Za-z0-9_\-]{3,32}$/', $username)) { $username='ed_'.substr
 $st=$db->prepare('SELECT * FROM users WHERE erendev_sub=?');
 $st->execute([$sub]); $user=$st->fetch();
 if (!$user) {
-  // Never auto-link to an existing local account by email: that would allow takeover.
   $chk=$db->prepare('SELECT 1 FROM users WHERE email=?'); $chk->execute([$email]);
   if ($chk->fetchColumn()) { http_response_code(409); exit(t('email_taken')); }
   $db->prepare('INSERT INTO users(username,email,password_hash,erendev_sub,created_at,last_seen_at) VALUES(?,?,?,?,?,?)')
@@ -3192,7 +3183,6 @@ PHP
 write_nginx() {
   install -d -o root -g root -m 0755 /etc/nginx/sites-available /etc/nginx/sites-enabled
   SOCK="/run/php/${PHP_VER}-fpm-liteforum.sock"
-  # default_server only for quick tunnel (random Host); named tunnels/domains match by server_name
   LISTEN_DEFAULT=" default_server"; [[ $CF_NAMED -eq 1 ]] && LISTEN_DEFAULT=""
   LISTEN_BIND=""; [[ $CF_NAMED -eq 1 || $CLOUDFLARED -eq 1 ]] && LISTEN_BIND="127.0.0.1:"
   IPV6_LINE=""; [[ -z "$LISTEN_BIND" ]] && IPV6_LINE="  listen [::]:${HTTP_PORT}${LISTEN_DEFAULT};"
@@ -3487,7 +3477,6 @@ UNIT
     return
   fi
 
-  # Point the app's base_url and OAuth redirect at the tunnel URL
   sed -i "s|https://localhost|$CF_URL|g" "$APP_DIR/config/config.php"
   ok "Cloudflare tunnel: $CF_URL"
 }
@@ -3605,7 +3594,6 @@ setup_backups() {
   chmod 0600 "$PASS"
   cat > /usr/local/sbin/liteforum-backup <<'SH'
 #!/usr/bin/env bash
-# Consistent SQLite snapshot (.backup is WAL-safe), encrypted, 14-day retention.
 set -Eeuo pipefail
 umask 077
 DB=/var/lib/liteforum/liteforum.db
@@ -3685,44 +3673,11 @@ LiteForum Installation
 URL             : $PUBLIC_URL
 Tunnel          : $(if [[ $CF_NAMED -eq 1 ]]; then echo "cloudflared named tunnel (Cloudflare terminates TLS, no certbot)"; elif [[ $CLOUDFLARED -eq 1 ]]; then echo "cloudflared quick tunnel (URL changes on restart)"; else echo none; fi)
 Install lang    : $LANG_CODE
-ErenDev OAuth   : $([[ $LANG_CODE == tr ]] && echo "shown only when UI=tr" || echo "hidden (no credentials)")
 Admin email     : $ADMIN_EMAIL
 Admin password  : $ADMIN_PASS
 App key         : $APP_KEY
-OAuth client_id : $OAuth_CLIENT_ID
-OAuth secret    : $OAuth_CLIENT_SECRET
 DB              : $DATA_DIR/liteforum.db
 Logs            : $LOG_DIR
-
-Features (v4):
-  ✓ Multi-language UI (tr/en/fr/de/es/ar) — switcher in header
-  ✓ Per-user theme + accent color + avatar color
-  ✓ Site name + tagline editable from /admin.php
-  ✓ Admin: category CRUD (add/edit/delete with all language names)
-  ✓ Admin: user role management + ban/unban
-  ✓ Admin: audit log
-  ✓ Moderation: pin/unpin, lock/unlock, delete post/topic
-  ✓ Notifications: mentions, replies, reactions (with per-user toggles)
-  ✓ Reactions: 👍 ❤️ 🔥 😂 😮
-  ✓ Password change from /settings.php
-  ✓ Password reset via email (/forgot-password.php)
-  ✓ User profiles with bio + avatar color
-  ✓ FTS5 search with bm25 ranking + snippet highlighting
-  ✓ Activity feed, stats page, online counter
-  ✓ Markdown-lite in posts (bold, italic, code, links, quotes, mentions)
-  ✓ Ban enforcement (blocked users cannot log in)
-  ✓ Double-gated ErenDev OAuth (install=tr AND ui=tr)
-  ✓ Dynamic roles with colored labels (admin panel)
-  ✓ Verified account badge (admin panel)
-  ✓ Image upload in topics and replies (jpg/png/gif/webp, 5 MB)
-  ✓ Topic tags per category, tag search (FTS5)
-  ✓ Cloudflare Turnstile on login/register (admin panel)
-  ✓ AI profile assistant (AES-256-GCM encrypted API key, cron worker)
-
-Troubleshooting:
-  sudo tail -30 /var/log/liteforum/error.log
-  ls -la $APP_DIR/public/
-  sudo systemctl status nginx $PHP_VER-fpm
 EOF
 chmod 0600 "$CRED_FILE"
 
