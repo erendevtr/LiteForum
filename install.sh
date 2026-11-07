@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# LiteForum — Complete One-Shot Installer (v4 — All Features, Fixed)
+# LiteForum — Complete One-Shot Installer (v4 — All Features, Fixed v4)
 # =============================================================================
 set -Eeuo pipefail
 umask 027
@@ -123,8 +123,9 @@ create_user() {
 }
 
 create_dirs() {
-  install -d -o root      -g root      -m 0755 "$APP_DIR" "$APP_DIR"/{public,app,config,lang,views,plugins}
-  install -d -o root      -g root      -m 0755 "$APP_DIR/public/oauth/erendev"
+  install -d -o root -g root -m 0755 /var/www
+  install -d -o root -g root -m 0755 "$APP_DIR" "$APP_DIR"/{public,app,config,lang,views,plugins}
+  install -d -o root -g root -m 0755 "$APP_DIR/public/oauth/erendev"
   install -d -o $SVC_USER -g $SVC_USER -m 0700 "$DATA_DIR" "$DATA_DIR"/{sessions,tmp,backups,uploads}
   install -d -o $SVC_USER -g adm -m 0750 "$LOG_DIR"
 }
@@ -493,6 +494,7 @@ PHP
   'post_too_fast'=>'You are posting too fast.','banned_msg'=>'Your account is banned.',
 ];
 PHP
+  # fr/de/es/ar (tam)
   cat > "$APP_DIR/lang/fr.php" <<'PHP'
 <?php return [
   'forum'=>'Forum','login'=>'Se connecter','register'=>"S'inscrire",'logout'=>'Se déconnecter',
@@ -2318,7 +2320,6 @@ PHP
     </form>
   <?php endforeach; ?>
 </div>
-
 
 <div class="glass card" style="margin-bottom:1.5rem">
   <h2 style="margin:0 0 1rem;font-size:1.2rem"><?= e(t('admin_settings')) ?></h2>
