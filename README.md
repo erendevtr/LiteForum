@@ -32,7 +32,7 @@ It is intentionally small. The whole application is plain PHP you can read top t
 
 ## Demo
 
-**https://demo.erendev.xyz**: installed with `--lang tr`, so the ErenDev button appears when the UI language is Turkish. The database resets nightly at 03:00 UTC.
+**https://demo.erendev.xyz**
 
 ---
 
