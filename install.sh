@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# LiteForum — One-Shot Installer (v4)
+# LiteForum — One-Shot Installer (v5)
 # =============================================================================
 set -Eeuo pipefail
 umask 027
@@ -35,18 +35,18 @@ exit 0; }
 need_val() { [[ $# -ge 2 && -n "$2" ]] || die "Missing value for $1"; }
 
 while [[ $# -gt 0 ]]; do case "$1" in
-  --domain)     need_val "$@"; DOMAIN="$2"; shift 2;;
-  --email)      need_val "$@"; EMAIL="$2"; shift 2;;
-  --admin)      need_val "$@"; ADMIN_EMAIL="$2"; shift 2;;
-  --lang)       need_val "$@"; LANG_CODE="$2"; shift 2;;
-  --skip-tls)   SKIP_TLS=1; shift;;
+  --domain)      need_val "$@"; DOMAIN="$2"; shift 2;;
+  --email)       need_val "$@"; EMAIL="$2"; shift 2;;
+  --admin)       need_val "$@"; ADMIN_EMAIL="$2"; shift 2;;
+  --lang)        need_val "$@"; LANG_CODE="$2"; shift 2;;
+  --skip-tls)    SKIP_TLS=1; shift;;
   --no-firewall) NO_FIREWALL=1; shift;;
-  --dry-run)    DRY_RUN=1; shift;;
+  --dry-run)     DRY_RUN=1; shift;;
   --cloudflared) CLOUDFLARED=1; shift;;
-  --cf-token)   need_val "$@"; CF_TOKEN="$2"; shift 2;;
-  --cf-login)   CF_LOGIN=1; shift;;
-  --port)       need_val "$@"; HTTP_PORT="$2"; shift 2;;
-  -h|--help)    usage;;
+  --cf-token)    need_val "$@"; CF_TOKEN="$2"; shift 2;;
+  --cf-login)    CF_LOGIN=1; shift;;
+  --port)        need_val "$@"; HTTP_PORT="$2"; shift 2;;
+  -h|--help)     usage;;
   *) die "Unknown arg: $1";;
 esac; done
 
@@ -115,9 +115,8 @@ install_packages() {
       ufw fail2ban unattended-upgrades \
       certbot python3-certbot-nginx logrotate rsync jq \
     || die "Package install failed"
-  apt-get install -y -qq libnginx-mod-http-headers-more-filter >/dev/null 2>&1 || true
-  command -v nginx   >/dev/null || die "nginx binary missing"
-  command -v php     >/dev/null || die "php missing"
+  command -v nginx >/dev/null || die "nginx binary missing"
+  command -v php   >/dev/null || die "php missing"
   ok "Packages installed ($PHP_VER)"
 }
 
@@ -140,6 +139,7 @@ gen_secrets() {
   ADMIN_PASS="$(openssl rand -hex 12)"
   OAUTH_CLIENT_ID="ed_app_$(openssl rand -hex 8)"
   OAUTH_CLIENT_SECRET="eds_$(openssl rand -hex 24)"
+  BOT_SUFFIX="$(openssl rand -hex 3)"
   ok "Secrets generated"
 }
 
@@ -181,6 +181,13 @@ CREATE TABLE users(
   last_seen_at INTEGER,
   last_login_at INTEGER
 );
+
+CREATE TABLE presence(
+  pkey TEXT PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  last_seen INTEGER NOT NULL
+);
+CREATE INDEX idx_presence_seen ON presence(last_seen);
 
 CREATE TABLE categories(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -314,10 +321,35 @@ CREATE TABLE uploads(
   created_at INTEGER NOT NULL
 );
 
+CREATE TABLE ai_providers(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  adapter TEXT NOT NULL,
+  base_url TEXT NOT NULL DEFAULT '',
+  default_model TEXT NOT NULL DEFAULT '',
+  api_key_enc TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  builtin INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE ai_profiles(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  provider_id INTEGER NOT NULL REFERENCES ai_providers(id) ON DELETE CASCADE,
+  model TEXT NOT NULL DEFAULT '',
+  system_prompt TEXT NOT NULL,
+  category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+  user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE ai_jobs(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
   post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+  profile_id INTEGER NOT NULL REFERENCES ai_profiles(id) ON DELETE CASCADE,
   status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','done','failed')),
   error TEXT,
   created_at INTEGER NOT NULL,
@@ -328,17 +360,13 @@ CREATE INDEX idx_ai_jobs_status ON ai_jobs(status, id);
 INSERT INTO settings(key,value) VALUES
   ('app_name','LiteForum'),
   ('app_tagline','A lightweight, modern forum'),
-  ('schema_version','4'),
-  ('ai_enabled','0'),('ai_provider','anthropic'),('ai_model',''),('ai_api_key_enc',''),
+  ('schema_version','5'),
+  ('ai_enabled','0'),
   ('turnstile_enabled','0'),('turnstile_site_key',''),('turnstile_secret_enc','');
-
-INSERT INTO users(username,email,password_hash,role,created_at,last_seen_at,is_verified)
-  VALUES('asistan','ai@liteforum.invalid','!','member',strftime('%s','now'),strftime('%s','now'),1);
-INSERT INTO settings(key,value) SELECT 'ai_user_id', CAST(id AS TEXT) FROM users WHERE username='asistan';
 SQL
   chown "$SVC_USER:$SVC_USER" "$DB"* 2>/dev/null || true
   chmod 0600 "$DB"* 2>/dev/null || true
-  ok "SQLite schema v4: $DB"
+  ok "SQLite schema v5: $DB"
 }
 
 setup_ai_cron() {
@@ -364,22 +392,22 @@ write_i18n() {
   'home'=>'Home','activity'=>'Activity','stats'=>'Statistics','profile'=>'Profile',
   'recent_topics'=>'Recent topics','latest_posts'=>'Latest posts','online_users'=>'Online',
   'members'=>'Members','total_topics'=>'Topics','total_posts'=>'Posts','total_users'=>'Members',
-  'joined'=>'Joined','last_seen'=>'Last seen','reply_to_topic'=>'Reply to topic',
-  'title'=>'Title','body'=>'Body','post_reply'=>'Reply','back'=>'Back',
+  'joined'=>'Joined','last_seen'=>'Last seen','popular'=>'Popular',
+  'title'=>'Title','body'=>'Body','post_reply'=>'Post reply','back'=>'Back','reply_to_topic'=>'Reply to topic',
   'all'=>'All','tag_search'=>'Search tags...','tags_max'=>'Tags (max 5)','image_upload'=>'Image (jpg, png, gif, webp; max 5 MB)',
   'title_body_required'=>'Title and body are required.','post_too_fast'=>'You are posting too fast. Please wait.',
-  'verified_account'=>'Verified account','erendev_login'=>'Sign in with ErenDev',
-  'too_many_attempts'=>'Too many attempts.','missing_info'=>'Missing information.',
+  'rate_wait'=>'Too fast. Please wait a moment.','verified_account'=>'Verified account',
+  'erendev_login'=>'Sign in with ErenDev','too_many_attempts'=>'Too many attempts.','missing_info'=>'Missing information.',
   'bad_credentials'=>'Incorrect email or password.','bot_detected'=>'Bot detected.',
   'register_limit'=>'Registration limit exceeded.','bad_username'=>'Username must be 3-32 characters.',
   'bad_email'=>'Enter a valid email.','weak_password'=>'Password must be at least 10 characters.',
   'already_exists'=>'Already registered.','saved'=>'Saved.','not_found'=>'Not found.',
-  'settings_saved'=>'Settings saved.','profile_updated'=>'Profile updated.',
-  'site_name'=>'Site name','site_tagline'=>'Site tagline','admin_settings'=>'Site settings','admin_panel'=>'Admin panel',
-  'tab_ai'=>'AI assistant','tab_turnstile'=>'Turnstile','tab_users'=>'Users & roles','tab_categories'=>'Categories','tab_audit'=>'Audit log',
-  'admin_audit'=>'Audit log','roles'=>'Roles','admin_users'=>'Users',
-  'admin_categories'=>'Category management','add_category'=>'Add category',
-  'edit_category'=>'Edit category','delete_category'=>'Delete category',
+  'settings_saved'=>'Settings saved.','site_name'=>'Site name','site_tagline'=>'Site tagline',
+  'admin_settings'=>'Site settings','admin_panel'=>'Admin panel',
+  'tab_general'=>'General','tab_ai'=>'AI assistant','tab_turnstile'=>'Turnstile','tab_users'=>'Users & roles',
+  'tab_categories'=>'Categories','tab_audit'=>'Audit log',
+  'admin_audit'=>'Audit log','roles'=>'Roles','admin_users'=>'Users','admin_categories'=>'Category management',
+  'add_category'=>'Add category','edit_category'=>'Edit category','delete_category'=>'Delete category',
   'delete_confirm'=>'Are you sure you want to delete this?','yes_delete'=>'Yes, delete',
   'no_topics_yet'=>'No topics yet.','loading'=>'Loading...','delete'=>'Delete','edit'=>'Edit',
   'slug'=>'Slug','icon'=>'Icon','position'=>'Position','description'=>'Description',
@@ -392,25 +420,32 @@ write_i18n() {
   'reset_invalid'=>'Link is invalid or expired.','reset_complete'=>'Password reset. You can now log in.',
   'pin'=>'Pin','unpin'=>'Unpin','lock'=>'Lock','unlock'=>'Unlock',
   'delete_post'=>'Delete post','delete_topic'=>'Delete topic',
-  'ban_user'=>'Ban user','unban_user'=>'Unban user','banned'=>'Banned','ban_reason'=>'Ban reason',
-  'mod_actions'=>'Moderator actions','mod_only'=>'You do not have permission.',
-  'reaction'=>'Reaction','reacted_to'=>'reacted to','edited'=>'edited','deleted_post'=>'[deleted]',
-  'latest'=>'Latest','popular'=>'Popular','no_more'=>'No more',
+  'ban_user'=>'Ban user','unban_user'=>'Unban user','banned'=>'Banned',
+  'mod_only'=>'You do not have permission.',
+  'edited'=>'edited','deleted_post'=>'[deleted]',
   'email_taken'=>'Email already in use.','invalid_token'=>'Invalid token.',
-  'banned_msg'=>'Your account is banned.','ai_enabled'=>'Enabled','ai_provider'=>'Provider',
-  'ai_model'=>'Model (empty = default)','ai_api_key'=>'API key','ai_key_saved'=>'Key saved (type a new one to replace)',
-  'ai_hint'=>'The key is encrypted with AES-256-GCM using app_key. Replies are generated by a worker every minute.',
+  'banned_msg'=>'Your account is banned.',
+  'ai_enabled'=>'Enabled','ai_global'=>'AI assistant is enabled','ai_hint'=>'Each enabled profile replies with its provider. Replies are generated by a worker every minute.',
+  'ai_providers'=>'Providers','ai_profiles'=>'Profiles','ai_add_provider'=>'Add custom provider',
+  'ai_provider'=>'Provider','ai_adapter'=>'Protocol','ai_base_url'=>'Base URL','ai_model'=>'Model',
+  'ai_default_model'=>'Default model','ai_api_key'=>'API key','ai_key_saved'=>'Key saved (type a new one to replace)',
+  'ai_no_key_needed'=>'No key needed','ai_profile_name'=>'Profile name','ai_system_prompt'=>'System prompt',
+  'ai_category'=>'Category (empty = all)','ai_add_profile'=>'Add profile','ai_edit_profile'=>'Edit profile',
+  'ai_model_hint'=>'Empty = provider default','ai_bad_url'=>'Invalid base URL. Use https (http is allowed only for localhost).',
+  'ai_profile_bad'=>'Name, provider and system prompt are required.','ai_provider_exists'=>'A provider with this slug already exists.',
+  'ai_key_hint'=>'Keys are stored encrypted with AES-256-GCM using app_key.',
   'ts_enabled'=>'Enabled on login and registration','ts_site_key'=>'Site key','ts_secret'=>'Secret key',
   'ts_secret_saved'=>'Secret saved (type a new one to replace)',
   'ts_hint'=>'If enabled without a secret key, login and registration are blocked.',
   'verify_user'=>'Verify user','verified'=>'Verified','assign_role'=>'Assign role','no_role'=>'No role',
   'assign'=>'Assign','create_role'=>'Create role','role_name'=>'Role name','power_level'=>'Power level',
   'role_hint'=>'Power level 50 and above grants moderator permissions. Custom roles cannot grant admin.',
-  'bulk_role'=>'Bulk set role','bulk_ids'=>'IDs: 1,2,3','set_role'=>'Set role','status'=>'Status',
-  'roles_existing'=>'Existing roles','category_tags'=>'Category tags','tags_placeholder'=>'design, guide, hobby',
+  'roles_existing'=>'Existing roles','bulk_role'=>'Bulk set role','bulk_ids'=>'IDs: 1,2,3','set_role'=>'Set role',
+  'status'=>'Status','category_tags'=>'Category tags','tags_placeholder'=>'design, guide, hobby',
   'tags_hint'=>'Tags appear as filters on the category page.','audit_when'=>'When','actor'=>'Actor','action'=>'Action',
   'notify_mentions'=>'Mentions','notify_replies'=>'Replies','notify_reactions'=>'Reactions','notify_digest'=>'Weekly digest',
-  'mentions_help'=>'Notify me when mentioned','rate_wait'=>'Too fast. Please wait a moment.',
+  'bio_label'=>'Bio','theme_label'=>'Theme','accent_label'=>'Accent color',
+  'ai_reply_fallback'=>'Reply',
 ];
 PHP
   cat > "$APP_DIR/lang/tr.php" <<'PHP'
@@ -426,22 +461,22 @@ PHP
   'home'=>'Ana Sayfa','activity'=>'Son Aktivite','stats'=>'İstatistikler','profile'=>'Profil',
   'recent_topics'=>'Son Konular','latest_posts'=>'Son Mesajlar','online_users'=>'Çevrimiçi',
   'members'=>'Üyeler','total_topics'=>'Konular','total_posts'=>'Mesajlar','total_users'=>'Üyeler',
-  'joined'=>'Katılım','last_seen'=>'Son görülme','reply_to_topic'=>'Konuya yanıt ver',
-  'title'=>'Başlık','body'=>'İçerik','post_reply'=>'Yanıtla','back'=>'Geri',
+  'joined'=>'Katılım','last_seen'=>'Son görülme','popular'=>'Popüler',
+  'title'=>'Başlık','body'=>'İçerik','post_reply'=>'Gönder','back'=>'Geri','reply_to_topic'=>'Konuya yanıt ver',
   'all'=>'Tümü','tag_search'=>'Etiket ara...','tags_max'=>'Etiketler (en fazla 5)','image_upload'=>'Resim (jpg, png, gif, webp; en fazla 5 MB)',
   'title_body_required'=>'Başlık ve içerik gerekli.','post_too_fast'=>'Çok hızlı yazıyorsunuz. Biraz bekleyin.',
-  'verified_account'=>'Doğrulanmış hesap','erendev_login'=>'ErenDev ile Giriş Yap',
-  'too_many_attempts'=>'Çok fazla deneme.','missing_info'=>'Eksik bilgi.',
+  'rate_wait'=>'Çok hızlı. Lütfen bir süre bekleyin.','verified_account'=>'Doğrulanmış hesap',
+  'erendev_login'=>'ErenDev ile Giriş Yap','too_many_attempts'=>'Çok fazla deneme.','missing_info'=>'Eksik bilgi.',
   'bad_credentials'=>'E-posta veya şifre hatalı.','bot_detected'=>'Bot tespit edildi.',
   'register_limit'=>'Kayıt limiti aşıldı.','bad_username'=>'Kullanıcı adı 3-32 karakter olmalı.',
   'bad_email'=>'Geçerli e-posta girin.','weak_password'=>'Şifre en az 10 karakter olmalı.',
   'already_exists'=>'Zaten kayıtlı.','saved'=>'Kaydedildi.','not_found'=>'Bulunamadı.',
-  'settings_saved'=>'Ayarlar kaydedildi.','profile_updated'=>'Profil güncellendi.',
-  'site_name'=>'Site adı','site_tagline'=>'Site sloganı','admin_settings'=>'Site ayarları','admin_panel'=>'Yönetim paneli',
-  'tab_ai'=>'Yapay zeka asistanı','tab_turnstile'=>'Turnstile','tab_users'=>'Kullanıcılar ve roller','tab_categories'=>'Kategoriler','tab_audit'=>'Denetim kaydı',
-  'admin_audit'=>'Denetim kaydı','roles'=>'Roller','admin_users'=>'Kullanıcılar',
-  'admin_categories'=>'Kategori yönetimi','add_category'=>'Kategori ekle',
-  'edit_category'=>'Kategoriyi düzenle','delete_category'=>'Kategoriyi sil',
+  'settings_saved'=>'Ayarlar kaydedildi.','site_name'=>'Site adı','site_tagline'=>'Site sloganı',
+  'admin_settings'=>'Site ayarları','admin_panel'=>'Yönetim paneli',
+  'tab_general'=>'Genel','tab_ai'=>'Yapay zeka asistanı','tab_turnstile'=>'Turnstile','tab_users'=>'Kullanıcılar ve roller',
+  'tab_categories'=>'Kategoriler','tab_audit'=>'Denetim kaydı',
+  'admin_audit'=>'Denetim kaydı','roles'=>'Roller','admin_users'=>'Kullanıcılar','admin_categories'=>'Kategori yönetimi',
+  'add_category'=>'Kategori ekle','edit_category'=>'Kategoriyi düzenle','delete_category'=>'Kategoriyi sil',
   'delete_confirm'=>'Silmek istediğinizden emin misiniz?','yes_delete'=>'Evet, sil',
   'no_topics_yet'=>'Henüz konu yok.','loading'=>'Yükleniyor...','delete'=>'Sil','edit'=>'Düzenle',
   'slug'=>'Kısa ad (slug)','icon'=>'Simge','position'=>'Sıra','description'=>'Açıklama',
@@ -454,64 +489,38 @@ PHP
   'reset_invalid'=>'Bağlantı geçersiz veya süresi dolmuş.','reset_complete'=>'Şifre sıfırlandı. Giriş yapabilirsiniz.',
   'pin'=>'Sabitle','unpin'=>'Sabitlemeyi kaldır','lock'=>'Kilitle','unlock'=>'Kilidi aç',
   'delete_post'=>'Mesajı sil','delete_topic'=>'Konuyu sil',
-  'ban_user'=>'Kullanıcıyı yasakla','unban_user'=>'Yasağı kaldır','banned'=>'Yasaklandı','ban_reason'=>'Yasak nedeni',
-  'mod_actions'=>'Moderatör işlemleri','mod_only'=>'Bu işlem için yetkiniz yok.',
-  'reaction'=>'Tepki','reacted_to'=>'tepki verdi','edited'=>'düzenlendi','deleted_post'=>'[silindi]',
-  'latest'=>'En son','popular'=>'Popüler','no_more'=>'Başka yok',
+  'ban_user'=>'Kullanıcıyı yasakla','unban_user'=>'Yasağı kaldır','banned'=>'Yasaklandı',
+  'mod_only'=>'Bu işlem için yetkiniz yok.',
+  'edited'=>'düzenlendi','deleted_post'=>'[silindi]',
   'email_taken'=>'Bu e-posta kullanılıyor.','invalid_token'=>'Geçersiz token.',
-  'banned_msg'=>'Hesabınız yasaklanmış.','ai_enabled'=>'Etkin','ai_provider'=>'Sağlayıcı',
-  'ai_model'=>'Model (boş = varsayılan)','ai_api_key'=>'API anahtarı','ai_key_saved'=>'Anahtar kayıtlı (değiştirmek için yeni yazın)',
-  'ai_hint'=>'Anahtar, app_key ile AES-256-GCM kullanılarak şifrelenip saklanır. Yanıtlar her dakika çalışan worker ile üretilir.',
+  'banned_msg'=>'Hesabınız yasaklanmış.',
+  'ai_enabled'=>'Etkin','ai_global'=>'Yapay zeka asistanı etkin','ai_hint'=>'Etkin her profil, bağlı olduğu sağlayıcıyla yanıt verir. Yanıtlar her dakika çalışan worker ile üretilir.',
+  'ai_providers'=>'Sağlayıcılar','ai_profiles'=>'Profiller','ai_add_provider'=>'Özel sağlayıcı ekle',
+  'ai_provider'=>'Sağlayıcı','ai_adapter'=>'Protokol','ai_base_url'=>'Temel adres','ai_model'=>'Model',
+  'ai_default_model'=>'Varsayılan model','ai_api_key'=>'API anahtarı','ai_key_saved'=>'Anahtar kayıtlı (değiştirmek için yeni yazın)',
+  'ai_no_key_needed'=>'Anahtar gerekmez','ai_profile_name'=>'Profil adı','ai_system_prompt'=>'Sistem promptu',
+  'ai_category'=>'Kategori (boş = tümü)','ai_add_profile'=>'Profil ekle','ai_edit_profile'=>'Profili düzenle',
+  'ai_model_hint'=>'Boş = sağlayıcının varsayılanı','ai_bad_url'=>'Geçersiz temel adres. https kullanın (http yalnızca localhost için).',
+  'ai_profile_bad'=>'Ad, sağlayıcı ve sistem promptu zorunlu.','ai_provider_exists'=>'Bu kısa ada sahip bir sağlayıcı zaten var.',
+  'ai_key_hint'=>'Anahtarlar app_key ile AES-256-GCM kullanılarak şifrelenip saklanır.',
   'ts_enabled'=>'Giriş ve kayıtta etkin','ts_site_key'=>'Site anahtarı','ts_secret'=>'Gizli anahtar',
   'ts_secret_saved'=>'Gizli anahtar kayıtlı (değiştirmek için yeni yazın)',
   'ts_hint'=>'Gizli anahtar tanımlı değilken etkinse giriş ve kayıt engellenir.',
   'verify_user'=>'Kullanıcıyı doğrula','verified'=>'Doğrulanmış','assign_role'=>'Rol ata','no_role'=>'Rol yok',
   'assign'=>'Ata','create_role'=>'Rol oluştur','role_name'=>'Rol adı','power_level'=>'Yetki seviyesi',
   'role_hint'=>'50 ve üzeri yetki seviyesi moderatör yetkisi verir. Özel roller yönetici yetkisi veremez.',
-  'bulk_role'=>'Toplu rol ata','bulk_ids'=>'ID: 1,2,3','set_role'=>'Rolü ayarla','status'=>'Durum',
-  'roles_existing'=>'Mevcut roller','category_tags'=>'Kategori etiketleri','tags_placeholder'=>'tasarım, rehber, hobi',
+  'roles_existing'=>'Mevcut roller','bulk_role'=>'Toplu rol ata','bulk_ids'=>'ID: 1,2,3','set_role'=>'Rolü ayarla',
+  'status'=>'Durum','category_tags'=>'Kategori etiketleri','tags_placeholder'=>'tasarım, rehber, hobi',
   'tags_hint'=>'Etiketler kategori sayfasında filtre olarak görünür.','audit_when'=>'Zaman','actor'=>'İşlemi yapan','action'=>'İşlem',
   'notify_mentions'=>'Bahsetmeler','notify_replies'=>'Yanıtlar','notify_reactions'=>'Tepkiler','notify_digest'=>'Haftalık özet',
-  'mentions_help'=>'Bahsedildiğimde bildir','rate_wait'=>'Çok hızlı. Lütfen bir süre bekleyin.',
-];
-PHP
-  # fr/de/es/ar: eksik anahtarlar İngilizceden tamamlanır (i18n_init birleştirir)
-  cat > "$APP_DIR/lang/fr.php" <<'PHP'
-<?php return [
-  'login'=>'Se connecter','register'=>"S'inscrire",'logout'=>'Se déconnecter','username'=>"Nom d'utilisateur",
-  'email'=>'E-mail','password'=>'Mot de passe','categories'=>'Catégories','topics'=>'Sujets','posts'=>'Messages',
-  'new_topic'=>'Nouveau sujet','reply'=>'Répondre','save'=>'Enregistrer','search'=>'Rechercher','settings'=>'Paramètres',
-  'home'=>'Accueil','profile'=>'Profil','online_users'=>'En ligne','notifications'=>'Notifications','admin_panel'=>'Panneau admin',
-];
-PHP
-  cat > "$APP_DIR/lang/de.php" <<'PHP'
-<?php return [
-  'login'=>'Anmelden','register'=>'Registrieren','logout'=>'Abmelden','username'=>'Benutzername','email'=>'E-Mail',
-  'password'=>'Passwort','categories'=>'Kategorien','topics'=>'Themen','posts'=>'Beiträge','new_topic'=>'Neues Thema',
-  'reply'=>'Antworten','save'=>'Speichern','search'=>'Suchen','settings'=>'Einstellungen','home'=>'Startseite',
-  'profile'=>'Profil','online_users'=>'Online','notifications'=>'Benachrichtigungen','admin_panel'=>'Admin-Bereich',
-];
-PHP
-  cat > "$APP_DIR/lang/es.php" <<'PHP'
-<?php return [
-  'login'=>'Iniciar sesión','register'=>'Registrarse','logout'=>'Cerrar sesión','username'=>'Usuario','email'=>'Correo',
-  'password'=>'Contraseña','categories'=>'Categorías','topics'=>'Temas','posts'=>'Mensajes','new_topic'=>'Nuevo tema',
-  'reply'=>'Responder','save'=>'Guardar','search'=>'Buscar','settings'=>'Ajustes','home'=>'Inicio',
-  'profile'=>'Perfil','online_users'=>'En línea','notifications'=>'Notificaciones','admin_panel'=>'Panel de administración',
-];
-PHP
-  cat > "$APP_DIR/lang/ar.php" <<'PHP'
-<?php return [
-  'login'=>'تسجيل الدخول','register'=>'إنشاء حساب','logout'=>'تسجيل الخروج','username'=>'اسم المستخدم','email'=>'البريد الإلكتروني',
-  'password'=>'كلمة المرور','categories'=>'الأقسام','topics'=>'المواضيع','posts'=>'المنشورات','new_topic'=>'موضوع جديد',
-  'reply'=>'رد','save'=>'حفظ','search'=>'بحث','settings'=>'الإعدادات','home'=>'الرئيسية',
-  'profile'=>'الملف','online_users'=>'متصل','notifications'=>'الإشعارات','admin_panel'=>'لوحة الإدارة',
+  'bio_label'=>'Hakkında','theme_label'=>'Tema','accent_label'=>'Vurgu rengi',
+  'ai_reply_fallback'=>'Yanıt',
 ];
 PHP
   chown -R root:root "$APP_DIR/lang"
   find "$APP_DIR/lang" -type d -exec chmod 0755 {} \;
   find "$APP_DIR/lang" -type f -exec chmod 0644 {} \;
-  ok "i18n (en/tr complete, others fall back to en)"
+  ok "i18n (en and tr complete; others fall back to English)"
 }
 
 write_app() {
@@ -580,9 +589,10 @@ if (!empty($_SESSION['user']['id'])) {
     $_SESSION['user']['role_power'] = (int)($u['role_power'] ?? 0);
     $_SESSION['user']['role_name']  = $u['role_name'];
     $_SESSION['user']['role_color'] = $u['role_color'];
-    $db->prepare('UPDATE users SET last_seen_at = ? WHERE id = ?')->execute([time(), (int)$_SESSION['user']['id']]);
   }
 }
+
+if (PHP_SAPI !== 'cli') presence_touch($db);
 PHP
 
   cat > "$APP_DIR/app/db.php" <<'PHP'
@@ -607,7 +617,6 @@ PHP
 <?php
 declare(strict_types=1);
 function e(?string $s): string { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
-function csp_nonce(): string { static $n = null; if ($n === null) $n = base64_encode(random_bytes(16)); return $n; }
 function redirect(string $to): never { header('Location: ' . $to, true, 302); exit; }
 function rate_limit(PDO $db, string $bucket, string $ip, int $max, int $w): bool {
   $now = time();
@@ -640,10 +649,10 @@ function time_ago(int $ts): string {
   return date('Y-m-d', $ts);
 }
 function cat_name(array $cat, string $lc): string {
-  return $cat['name_' . $lc] ?? $cat['name_en'] ?? $cat['name_tr'] ?? '';
+  return ($cat['name_' . $lc] ?? '') !== '' ? $cat['name_' . $lc] : ($cat['name_en'] ?? $cat['name_tr'] ?? '');
 }
 function cat_desc(array $cat, string $lc): string {
-  return $cat['description_' . $lc] ?? $cat['description_en'] ?? $cat['description_tr'] ?? '';
+  return ($cat['description_' . $lc] ?? '') !== '' ? $cat['description_' . $lc] : ($cat['description_en'] ?? $cat['description_tr'] ?? '');
 }
 function is_mod(?array $u): bool {
   return $u !== null && (in_array($u['role'], ['moderator', 'admin'], true) || (int)($u['role_power'] ?? 0) >= 50);
@@ -690,6 +699,8 @@ function auth_mod(): array {
   return $u;
 }
 function auth_login(array $u): void {
+  // Visitor was a guest until now: drop the guest presence row so they are counted once.
+  $GLOBALS['db']->prepare('DELETE FROM presence WHERE pkey = ?')->execute([presence_guest_key()]);
   session_regenerate_id(true);
   $_SESSION['user'] = [
     'id'               => (int)$u['id'],
@@ -742,8 +753,8 @@ PHP
 declare(strict_types=1);
 function theme_css_vars(): string {
   $u = $_SESSION['user'] ?? null;
-  $theme  = $u['theme']  ?? ($_SESSION['theme']  ?? 'dark');
-  $accent = $u['accent'] ?? ($_SESSION['accent'] ?? 'indigo');
+  $theme  = $u['theme']  ?? 'dark';
+  $accent = $u['accent'] ?? 'indigo';
   $map = [
     'indigo'  => ['500' => '#6366f1', '600' => '#4f46e5', '400' => '#818cf8', 'glow' => 'rgba(79,70,229,.25)'],
     'emerald' => ['500' => '#10b981', '600' => '#059669', '400' => '#34d399', 'glow' => 'rgba(16,185,129,.25)'],
@@ -900,9 +911,39 @@ PHP
   cat > "$APP_DIR/app/activity.php" <<'PHP'
 <?php
 declare(strict_types=1);
+const ONLINE_WINDOW = 300; // seconds
+
+/** Stable key for a guest, derived from the session id so the raw id is never stored. */
+function presence_guest_key(): string {
+  return 'g' . substr(hash('sha256', session_id()), 0, 40);
+}
+
+/** Records the current visitor (member or guest) as active. Called once per web request. */
+function presence_touch(PDO $db): void {
+  $uid = !empty($_SESSION['user']['id']) ? (int)$_SESSION['user']['id'] : null;
+  $key = $uid ? 'u' . $uid : presence_guest_key();
+  $now = time();
+  $db->prepare('INSERT INTO presence(pkey, user_id, last_seen) VALUES(?, ?, ?)
+                ON CONFLICT(pkey) DO UPDATE SET user_id = excluded.user_id, last_seen = excluded.last_seen')
+     ->execute([$key, $uid, $now]);
+  if ($uid) {
+    $db->prepare('UPDATE users SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)')
+       ->execute([$now, $uid, $now - 60]);
+  }
+  if (random_int(1, 100) === 1) {
+    $db->prepare('DELETE FROM presence WHERE last_seen < ?')->execute([$now - 86400]);
+  }
+}
+/** Everyone (members and guests) active in the last ONLINE_WINDOW seconds. */
 function online_count(PDO $db): int {
-  $st = $db->prepare('SELECT COUNT(*) FROM users WHERE last_seen_at > ?');
-  $st->execute([time() - 900]);
+  $st = $db->prepare('SELECT COUNT(*) FROM presence WHERE last_seen > ?');
+  $st->execute([time() - ONLINE_WINDOW]);
+  return (int)$st->fetchColumn();
+}
+/** Registered members active in the last ONLINE_WINDOW seconds. */
+function online_members_count(PDO $db): int {
+  $st = $db->prepare('SELECT COUNT(*) FROM presence WHERE last_seen > ? AND user_id IS NOT NULL');
+  $st->execute([time() - ONLINE_WINDOW]);
   return (int)$st->fetchColumn();
 }
 function recent_topics(PDO $db, int $limit = 10): array {
@@ -922,11 +963,12 @@ function recent_posts(PDO $db, int $limit = 10): array {
 }
 function forum_stats(PDO $db): array {
   return [
-    'topics' => (int)$db->query('SELECT COUNT(*) FROM topics')->fetchColumn(),
-    'posts'  => (int)$db->query('SELECT COUNT(*) FROM posts WHERE is_deleted = 0')->fetchColumn(),
-    'users'  => (int)$db->query('SELECT COUNT(*) FROM users')->fetchColumn(),
-    'online' => online_count($db),
-    'newest' => $db->query('SELECT username, created_at FROM users ORDER BY id DESC LIMIT 1')->fetch() ?: null,
+    'topics'  => (int)$db->query('SELECT COUNT(*) FROM topics')->fetchColumn(),
+    'posts'   => (int)$db->query('SELECT COUNT(*) FROM posts WHERE is_deleted = 0')->fetchColumn(),
+    'users'   => (int)$db->query('SELECT COUNT(*) FROM users')->fetchColumn(),
+    'online'  => online_count($db),
+    'members_online' => online_members_count($db),
+    'newest'  => $db->query('SELECT username, created_at FROM users ORDER BY id DESC LIMIT 1')->fetch() ?: null,
   ];
 }
 PHP
@@ -1093,20 +1135,205 @@ PHP
   cat > "$APP_DIR/app/ai.php" <<'PHP'
 <?php
 declare(strict_types=1);
-const AI_SYSTEM_PROMPT = 'You are the assistant of the LiteForum forum. Write a short, helpful reply that fits the conversation. '
-  . 'Reply in the language of the topic. Do not produce harmful, misleading, or personal-data-seeking content. Return only the reply text.';
+/*
+ * AI adapters. Each provider speaks its own protocol; each protocol has its own function below.
+ * To add a provider that speaks an existing protocol, insert a row in ai_providers (admin panel).
+ * To add a new protocol, write ai_<name>() here, add it to ai_adapters() and to ai_call().
+ */
+const AI_SAFETY_SUFFIX = ' Return only the reply text. Do not produce harmful, misleading, or personal-data-seeking content. Reply in the language of the topic.';
+const AI_MAX_TOKENS = 800;
 
-function ai_enqueue(PDO $db, int $topicId, int $postId, int $authorId): void {
-  $aiId = (int)settings_get($db, 'ai_user_id', '0');
-  if (settings_get($db, 'ai_enabled', '0') !== '1' || $aiId <= 0 || $aiId === $authorId) return;
-  $db->prepare("INSERT INTO ai_jobs(topic_id, post_id, status, created_at, updated_at) VALUES(?, ?, 'queued', ?, ?)")
-     ->execute([$topicId, $postId, time(), time()]);
+function ai_adapters(): array {
+  return [
+    'anthropic'     => 'Anthropic Messages',
+    'openai'        => 'OpenAI Chat Completions',
+    'gemini'        => 'Google Gemini generateContent',
+    'groq'          => 'Groq Chat Completions',
+    'openrouter'    => 'OpenRouter Chat Completions',
+    'mistral'       => 'Mistral Chat Completions',
+    'together'      => 'Together AI Chat Completions',
+    'deepseek'      => 'DeepSeek Chat Completions',
+    'cohere'        => 'Cohere Chat v2',
+    'ollama'        => 'Ollama Chat (local)',
+    'openai_compat' => 'Custom OpenAI-compatible',
+  ];
 }
+
+/** Validates an admin-supplied base URL. https is required, http only for localhost. */
+function ai_valid_base(string $url): string {
+  $url = rtrim(trim($url), '/');
+  $p = $url === '' ? false : parse_url($url);
+  if (!$p || empty($p['scheme']) || empty($p['host']) || isset($p['user']) || isset($p['pass'])) {
+    throw new RuntimeException(t('ai_bad_url'));
+  }
+  $local = in_array($p['host'], ['127.0.0.1', 'localhost'], true);
+  if ($p['scheme'] !== 'https' && !($p['scheme'] === 'http' && $local)) {
+    throw new RuntimeException(t('ai_bad_url'));
+  }
+  return $url;
+}
+
+/** POSTs JSON, returns decoded array or throws with a short, key-free error. */
+function ai_http(string $url, array $headers, array $body, int $timeout = 90): array {
+  $ch = curl_init($url);
+  curl_setopt_array($ch, [
+    CURLOPT_POST => true,
+    CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+    CURLOPT_HTTPHEADER => array_merge(['Content-Type: application/json', 'Accept: application/json'], $headers),
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_TIMEOUT => $timeout,
+    CURLOPT_SSL_VERIFYPEER => true,
+  ]);
+  $res = curl_exec($ch);
+  $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+  $err = curl_error($ch);
+  curl_close($ch);
+  if (!is_string($res)) throw new RuntimeException('Transport error: ' . mb_substr($err, 0, 120));
+  $j = json_decode($res, true);
+  if ($code < 200 || $code >= 300) {
+    $hint = is_array($j) ? mb_substr((string)json_encode($j, JSON_UNESCAPED_UNICODE), 0, 160) : '';
+    throw new RuntimeException("HTTP $code $hint");
+  }
+  if (!is_array($j)) throw new RuntimeException('Invalid JSON from provider');
+  return $j;
+}
+
+function ai_text(?string $t): string {
+  $t = trim((string)$t);
+  if ($t === '') throw new RuntimeException('Empty reply from provider');
+  return mb_substr($t, 0, 8000);
+}
+
+/* ---------- Protocol: Anthropic Messages ---------- */
+function ai_anthropic(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/v1/messages',
+    ['x-api-key: ' . $key, 'anthropic-version: 2023-06-01'],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS, 'system' => $system,
+     'messages' => [['role' => 'user', 'content' => $user]]]);
+  $parts = array_filter($j['content'] ?? [], fn($c) => ($c['type'] ?? '') === 'text');
+  return ai_text(implode('', array_column($parts, 'text')));
+}
+
+/* ---------- Protocol: OpenAI Chat Completions ---------- */
+function ai_openai(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/chat/completions',
+    ['Authorization: Bearer ' . $key],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['choices'][0]['message']['content'] ?? null);
+}
+
+/* ---------- Protocol: Google Gemini generateContent (native) ---------- */
+function ai_gemini(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/models/' . rawurlencode($model) . ':generateContent',
+    ['x-goog-api-key: ' . $key],
+    ['system_instruction' => ['parts' => [['text' => $system]]],
+     'contents' => [['role' => 'user', 'parts' => [['text' => $user]]]],
+     'generationConfig' => ['maxOutputTokens' => 1024]]);
+  $parts = $j['candidates'][0]['content']['parts'] ?? [];
+  return ai_text(implode('', array_map(fn($p) => (string)($p['text'] ?? ''), $parts)));
+}
+
+/* ---------- Protocol: Groq (OpenAI-style request, Groq endpoint and headers) ---------- */
+function ai_groq(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/chat/completions',
+    ['Authorization: Bearer ' . $key],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS, 'temperature' => 0.7,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['choices'][0]['message']['content'] ?? null);
+}
+
+/* ---------- Protocol: OpenRouter (OpenAI-style, plus app attribution headers) ---------- */
+function ai_openrouter(string $base, string $key, string $model, string $system, string $user): string {
+  $site = $GLOBALS['__config']['base_url'] ?? 'https://localhost';
+  $j = ai_http($base . '/chat/completions',
+    ['Authorization: Bearer ' . $key, 'HTTP-Referer: ' . $site, 'X-Title: LiteForum'],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['choices'][0]['message']['content'] ?? null);
+}
+
+/* ---------- Protocol: Mistral (OpenAI-style, own endpoint) ---------- */
+function ai_mistral(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/chat/completions',
+    ['Authorization: Bearer ' . $key],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['choices'][0]['message']['content'] ?? null);
+}
+
+/* ---------- Protocol: Together AI (OpenAI-style, own endpoint) ---------- */
+function ai_together(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/chat/completions',
+    ['Authorization: Bearer ' . $key],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['choices'][0]['message']['content'] ?? null);
+}
+
+/* ---------- Protocol: DeepSeek (OpenAI-style, own endpoint) ---------- */
+function ai_deepseek(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/chat/completions',
+    ['Authorization: Bearer ' . $key],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS, 'stream' => false,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['choices'][0]['message']['content'] ?? null);
+}
+
+/* ---------- Protocol: Cohere Chat v2 ---------- */
+function ai_cohere(string $base, string $key, string $model, string $system, string $user): string {
+  $j = ai_http($base . '/v2/chat',
+    ['Authorization: Bearer ' . $key],
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  $parts = array_filter($j['message']['content'] ?? [], fn($c) => ($c['type'] ?? '') === 'text');
+  return ai_text(implode('', array_column($parts, 'text')));
+}
+
+/* ---------- Protocol: Ollama Chat (local, no key) ---------- */
+function ai_ollama(string $base, string $key, string $model, string $system, string $user): string {
+  $headers = $key !== '' ? ['Authorization: Bearer ' . $key] : [];
+  $j = ai_http($base . '/api/chat', $headers,
+    ['model' => $model, 'stream' => false,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['message']['content'] ?? null);
+}
+
+/* ---------- Protocol: Custom OpenAI-compatible endpoint (admin supplies base URL) ---------- */
+function ai_openai_compat(string $base, string $key, string $model, string $system, string $user): string {
+  $headers = $key !== '' ? ['Authorization: Bearer ' . $key] : [];
+  $j = ai_http($base . '/chat/completions', $headers,
+    ['model' => $model, 'max_tokens' => AI_MAX_TOKENS,
+     'messages' => [['role' => 'system', 'content' => $system], ['role' => 'user', 'content' => $user]]]);
+  return ai_text($j['choices'][0]['message']['content'] ?? null);
+}
+
+/** Dispatches to the protocol function for the provider's adapter. */
+function ai_call(string $adapter, string $base, string $key, string $model, string $system, string $user): string {
+  $b = rtrim($base, '/');
+  return match ($adapter) {
+    'anthropic'     => ai_anthropic($b, $key, $model, $system, $user),
+    'openai'        => ai_openai($b, $key, $model, $system, $user),
+    'gemini'        => ai_gemini($b, $key, $model, $system, $user),
+    'groq'          => ai_groq($b, $key, $model, $system, $user),
+    'openrouter'    => ai_openrouter($b, $key, $model, $system, $user),
+    'mistral'       => ai_mistral($b, $key, $model, $system, $user),
+    'together'      => ai_together($b, $key, $model, $system, $user),
+    'deepseek'      => ai_deepseek($b, $key, $model, $system, $user),
+    'cohere'        => ai_cohere($b, $key, $model, $system, $user),
+    'ollama'        => ai_ollama($b, $key, $model, $system, $user),
+    'openai_compat' => ai_openai_compat($b, $key, $model, $system, $user),
+    default         => throw new RuntimeException('Unknown adapter: ' . $adapter),
+  };
+}
+
+/** Builds the topic context shown to the model. */
 function ai_context(PDO $db, int $topicId): string {
   $t = $db->prepare('SELECT title FROM topics WHERE id = ?');
   $t->execute([$topicId]);
   $title = (string)$t->fetchColumn();
-  $p = $db->prepare('SELECT u.username, p.body FROM posts p JOIN users u ON u.id = p.user_id WHERE p.topic_id = ? AND p.is_deleted = 0 ORDER BY p.created_at DESC LIMIT 8');
+  $p = $db->prepare('SELECT u.username, p.body FROM posts p JOIN users u ON u.id = p.user_id
+                     WHERE p.topic_id = ? AND p.is_deleted = 0 ORDER BY p.created_at DESC LIMIT 8');
   $p->execute([$topicId]);
   $out = "Topic title: $title\n\nRecent posts:\n";
   foreach (array_reverse($p->fetchAll()) as $r) {
@@ -1114,52 +1341,56 @@ function ai_context(PDO $db, int $topicId): string {
   }
   return $out;
 }
-function ai_call(string $provider, string $model, string $key, string $user): string {
-  if ($provider === 'openai') {
-    $url = 'https://api.openai.com/v1/chat/completions';
-    $headers = ["Authorization: Bearer $key", 'Content-Type: application/json'];
-    $payload = ['model' => $model !== '' ? $model : 'gpt-4o-mini', 'max_tokens' => 800,
-                'messages' => [['role' => 'system', 'content' => AI_SYSTEM_PROMPT], ['role' => 'user', 'content' => $user]]];
-  } else {
-    $url = 'https://api.anthropic.com/v1/messages';
-    $headers = ["x-api-key: $key", 'anthropic-version: 2023-06-01', 'Content-Type: application/json'];
-    $payload = ['model' => $model !== '' ? $model : 'claude-haiku-4-5', 'max_tokens' => 800,
-                'system' => AI_SYSTEM_PROMPT, 'messages' => [['role' => 'user', 'content' => $user]]];
-  }
-  $ch = curl_init($url);
-  curl_setopt_array($ch, [
-    CURLOPT_POST => true,
-    CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE),
-    CURLOPT_HTTPHEADER => $headers,
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => 60,
-    CURLOPT_SSL_VERIFYPEER => true,
-  ]);
-  $res = curl_exec($ch);
-  $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-  curl_close($ch);
-  if (!is_string($res) || $code !== 200) throw new RuntimeException("API HTTP $code");
-  $j = json_decode($res, true);
-  $text = $provider === 'openai' ? ($j['choices'][0]['message']['content'] ?? '') : ($j['content'][0]['text'] ?? '');
-  $text = trim((string)$text);
-  if ($text === '') throw new RuntimeException('Empty response');
-  return mb_substr($text, 0, 8000);
+
+/**
+ * Queues one reply for a new post. Picks the first enabled profile whose category matches
+ * (category-specific profiles first, then profiles for all categories).
+ */
+function ai_enqueue(PDO $db, int $topicId, int $postId, int $authorId, ?int $categoryId): void {
+  if (settings_get($db, 'ai_enabled', '0') !== '1') return;
+  $isBot = $db->prepare('SELECT 1 FROM ai_profiles WHERE user_id = ?');
+  $isBot->execute([$authorId]);
+  if ($isBot->fetchColumn()) return;
+  $st = $db->prepare('SELECT p.id FROM ai_profiles p JOIN ai_providers pr ON pr.id = p.provider_id
+                      WHERE p.enabled = 1 AND pr.enabled = 1 AND (p.category_id IS NULL OR p.category_id = ?)
+                      ORDER BY (p.category_id IS NULL) ASC, p.id ASC LIMIT 1');
+  $st->execute([$categoryId ?? 0]);
+  $profileId = (int)$st->fetchColumn();
+  if ($profileId <= 0) return;
+  $db->prepare("INSERT INTO ai_jobs(topic_id, post_id, profile_id, status, created_at, updated_at) VALUES(?, ?, ?, 'queued', ?, ?)")
+     ->execute([$topicId, $postId, $profileId, time(), time()]);
 }
+
+/** Processes up to $limit queued jobs. Called by the cron worker every minute. */
 function ai_run_jobs(PDO $db, array $config, int $limit = 5): int {
-  $key      = secret_decrypt(settings_get($db, 'ai_api_key_enc', ''), $config['app_key']) ?? '';
-  $provider = settings_get($db, 'ai_provider', 'anthropic');
-  $model    = settings_get($db, 'ai_model', '');
-  $aiId     = (int)settings_get($db, 'ai_user_id', '0');
-  $jobs = $db->query("SELECT * FROM ai_jobs WHERE status = 'queued' ORDER BY id LIMIT " . (int)$limit)->fetchAll();
+  if (settings_get($db, 'ai_enabled', '0') !== '1') return 0;
+  $st = $db->prepare("SELECT j.id, j.topic_id, p.system_prompt, p.model AS profile_model, p.user_id,
+                             pr.adapter, pr.base_url, pr.default_model, pr.api_key_enc
+                      FROM ai_jobs j
+                      JOIN ai_profiles p ON p.id = j.profile_id
+                      JOIN ai_providers pr ON pr.id = p.provider_id
+                      WHERE j.status = 'queued' AND p.enabled = 1 AND pr.enabled = 1
+                      ORDER BY j.id LIMIT ?");
+  $st->bindValue(1, $limit, PDO::PARAM_INT);
+  $st->execute();
+  $jobs = $st->fetchAll();
   $done = 0;
   foreach ($jobs as $j) {
     $jid = (int)$j['id'];
     $db->prepare("UPDATE ai_jobs SET status = 'running', updated_at = ? WHERE id = ?")->execute([time(), $jid]);
     try {
-      if ($key === '') throw new RuntimeException('API key not set');
-      $reply = ai_call($provider, $model, $key, ai_context($db, (int)$j['topic_id']));
+      $key = secret_decrypt((string)$j['api_key_enc'], $config['app_key']) ?? '';
+      if ($key === '' && !in_array($j['adapter'], ['ollama', 'openai_compat'], true)) {
+        throw new RuntimeException('API key not set for this provider');
+      }
+      $model = trim((string)$j['profile_model']) !== '' ? (string)$j['profile_model'] : (string)$j['default_model'];
+      $reply = ai_call(
+        (string)$j['adapter'], (string)$j['base_url'], $key, $model,
+        trim((string)$j['system_prompt']) . AI_SAFETY_SUFFIX,
+        ai_context($db, (int)$j['topic_id'])
+      );
       $db->prepare('INSERT INTO posts(topic_id, user_id, body, created_at, updated_at) VALUES(?, ?, ?, ?, ?)')
-         ->execute([(int)$j['topic_id'], $aiId, $reply, time(), time()]);
+         ->execute([(int)$j['topic_id'], (int)$j['user_id'], $reply, time(), time()]);
       $db->prepare('UPDATE topics SET updated_at = ? WHERE id = ?')->execute([time(), (int)$j['topic_id']]);
       $db->prepare("UPDATE ai_jobs SET status = 'done', updated_at = ? WHERE id = ?")->execute([time(), $jid]);
       $done++;
@@ -1180,18 +1411,116 @@ function admin_user_id(PDO $db, string $username): int {
   $st->execute([trim($username)]);
   return (int)$st->fetchColumn();
 }
-/** Handles tab-scoped actions. Returns true if the action was recognised. */
+
+/** Handles tab-scoped actions. Returns true when the action was recognised. */
 function admin_extra_action(PDO $db, array $u, array $config, string $action): bool {
   switch ($action) {
-    case 'save_ai':
-      $prov = (string)($_POST['ai_provider'] ?? '');
-      settings_set($db, 'ai_provider', in_array($prov, ['anthropic', 'openai'], true) ? $prov : 'anthropic');
-      settings_set($db, 'ai_model', mb_substr(trim((string)($_POST['ai_model'] ?? '')), 0, 64));
+
+    case 'save_ai_global':
       settings_set($db, 'ai_enabled', isset($_POST['ai_enabled']) ? '1' : '0');
-      $key = trim((string)($_POST['ai_api_key'] ?? ''));
-      if ($key !== '') settings_set($db, 'ai_api_key_enc', secret_encrypt($key, $config['app_key']));
-      audit($db, $u, 'ai.settings');
+      audit($db, $u, 'ai.global', null, null, ['enabled' => isset($_POST['ai_enabled'])]);
       flash_set('ok', t('settings_saved'));
+      return true;
+
+    case 'save_provider':
+      $id = (int)($_POST['provider_id'] ?? 0);
+      $st = $db->prepare('SELECT * FROM ai_providers WHERE id = ?');
+      $st->execute([$id]);
+      $pv = $st->fetch();
+      if (!$pv) { flash_set('err', t('not_found')); return true; }
+      try {
+        $base = ai_valid_base((string)($_POST['base_url'] ?? $pv['base_url']));
+      } catch (RuntimeException $ex) {
+        flash_set('err', $ex->getMessage());
+        return true;
+      }
+      $model = mb_substr(trim((string)($_POST['default_model'] ?? '')), 0, 100);
+      $db->prepare('UPDATE ai_providers SET base_url = ?, default_model = ?, enabled = ? WHERE id = ?')
+         ->execute([$base, $model, isset($_POST['enabled']) ? 1 : 0, $id]);
+      $key = trim((string)($_POST['api_key'] ?? ''));
+      if ($key !== '') {
+        $db->prepare('UPDATE ai_providers SET api_key_enc = ? WHERE id = ?')
+           ->execute([secret_encrypt($key, $config['app_key']), $id]);
+      }
+      audit($db, $u, 'ai.provider_update', 'ai_provider', $id);
+      flash_set('ok', t('saved'));
+      return true;
+
+    case 'add_provider':
+      $name    = mb_substr(trim((string)($_POST['name'] ?? '')), 0, 60);
+      $slug    = strtolower(preg_replace('/[^a-z0-9\-]/i', '', (string)($_POST['slug'] ?? '')));
+      $adapter = (string)($_POST['adapter'] ?? '');
+      $model   = mb_substr(trim((string)($_POST['default_model'] ?? '')), 0, 100);
+      if ($name === '' || strlen($slug) < 2 || !array_key_exists($adapter, ai_adapters())) {
+        flash_set('err', t('ai_profile_bad'));
+        return true;
+      }
+      try {
+        $base = ai_valid_base((string)($_POST['base_url'] ?? ''));
+      } catch (RuntimeException $ex) {
+        flash_set('err', $ex->getMessage());
+        return true;
+      }
+      try {
+        $db->prepare('INSERT INTO ai_providers(slug, name, adapter, base_url, default_model, enabled, builtin) VALUES(?, ?, ?, ?, ?, 1, 0)')
+           ->execute([$slug, $name, $adapter, $base, $model]);
+        audit($db, $u, 'ai.provider_add', 'ai_provider', (int)$db->lastInsertId());
+        flash_set('ok', t('saved'));
+      } catch (PDOException) {
+        flash_set('err', t('ai_provider_exists'));
+      }
+      return true;
+
+    case 'save_profile':
+      $id      = (int)($_POST['profile_id'] ?? 0);
+      $name    = mb_substr(trim((string)($_POST['name'] ?? '')), 0, 60);
+      $provId  = (int)($_POST['provider_id'] ?? 0);
+      $model   = mb_substr(trim((string)($_POST['model'] ?? '')), 0, 100);
+      $prompt  = mb_substr(trim((string)($_POST['system_prompt'] ?? '')), 0, 4000);
+      $catRaw  = (string)($_POST['category_id'] ?? '');
+      $catId   = ctype_digit($catRaw) && (int)$catRaw > 0 ? (int)$catRaw : null;
+      $enabled = isset($_POST['enabled']) ? 1 : 0;
+      if ($name === '' || $prompt === '' || $provId <= 0) {
+        flash_set('err', t('ai_profile_bad'));
+        return true;
+      }
+      $chk = $db->prepare('SELECT 1 FROM ai_providers WHERE id = ?');
+      $chk->execute([$provId]);
+      if (!$chk->fetchColumn()) { flash_set('err', t('not_found')); return true; }
+      try {
+        if ($id > 0) {
+          $db->prepare('UPDATE ai_profiles SET name = ?, provider_id = ?, model = ?, system_prompt = ?, category_id = ?, enabled = ? WHERE id = ?')
+             ->execute([$name, $provId, $model, $prompt, $catId, $enabled, $id]);
+          audit($db, $u, 'ai.profile_update', 'ai_profile', $id);
+        } else {
+          // Each profile posts as its own bot account, so replies show who wrote them.
+          $suffix = bin2hex(random_bytes(3));
+          $handle = substr((string)preg_replace('/[^A-Za-z0-9]+/', '_', $name), 0, 20);
+          $handle = ($handle !== '' ? $handle : 'ai') . '_' . $suffix;
+          $db->prepare('INSERT INTO users(username, email, password_hash, role, created_at, last_seen_at, is_verified) VALUES(?, ?, ?, ?, ?, ?, 1)')
+             ->execute([$handle, 'ai+' . $suffix . '@liteforum.invalid', '!', 'member', time(), time()]);
+          $uid = (int)$db->lastInsertId();
+          $db->prepare('INSERT INTO ai_profiles(name, provider_id, model, system_prompt, category_id, user_id, enabled, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)')
+             ->execute([$name, $provId, $model, $prompt, $catId, $uid, $enabled, time()]);
+          audit($db, $u, 'ai.profile_add', 'ai_profile', (int)$db->lastInsertId());
+        }
+        flash_set('ok', t('saved'));
+      } catch (PDOException) {
+        flash_set('err', t('already_exists'));
+      }
+      return true;
+
+    case 'delete_profile':
+      $id = (int)($_POST['profile_id'] ?? 0);
+      if ($id > 0) {
+        $st = $db->prepare('SELECT user_id FROM ai_profiles WHERE id = ?');
+        $st->execute([$id]);
+        $botId = $st->fetchColumn();
+        $db->prepare('DELETE FROM ai_profiles WHERE id = ?')->execute([$id]);
+        if ($botId) $db->prepare('UPDATE users SET banned = 1 WHERE id = ?')->execute([$botId]);
+        audit($db, $u, 'ai.profile_delete', 'ai_profile', $id);
+        flash_set('ok', t('saved'));
+      }
       return true;
 
     case 'save_turnstile':
@@ -1347,7 +1676,6 @@ $lcNow = $_SESSION['ui_lang'] ?? 'en';
   .text-sm{font-size:.875rem}
   .flex{display:flex;gap:.75rem;align-items:center}
   .flex-wrap{flex-wrap:wrap}
-  .flex-col{flex-direction:column}
   .grid{display:grid;gap:1rem}
   .field{display:grid;gap:.35rem;font-size:.9rem}
   .field > span{color:var(--fg-muted)}
@@ -2020,6 +2348,7 @@ PHP
   <div class="stat-card"><div class="num"><?= (int)$stats['posts'] ?></div><div class="label"><?= e(t('total_posts')) ?></div></div>
   <div class="stat-card"><div class="num"><?= (int)$stats['users'] ?></div><div class="label"><?= e(t('total_users')) ?></div></div>
   <div class="stat-card"><div class="num"><?= (int)$stats['online'] ?></div><div class="label"><?= e(t('online_users')) ?></div></div>
+  <div class="stat-card"><div class="num"><?= (int)$stats['members_online'] ?></div><div class="label"><?= e(t('members')) ?></div></div>
 </div>
 <?php if ($stats['newest']): ?>
 <div class="glass card" style="margin-bottom:1rem">
@@ -2070,9 +2399,13 @@ PHP
 PHP
 
   cat > "$APP_DIR/views/admin.php" <<'PHP'
-<?php /* @var string $tab @var array $users @var array $roles @var array $cats @var array $catTags @var ?array $editCat @var array $audit @var string $appName @var string $appTagline */
+<?php
+/* @var string $tab @var array $users @var array $roles @var array $cats @var array $catTags
+   @var ?array $editCat @var array $audit @var string $appName @var string $appTagline
+   @var array $providers @var array $profiles @var array $catsAll @var array $adapters
+   @var ?array $editProfile @var string $aiEnabled */
 $tabField = '<input type="hidden" name="tab" value="' . e($tab) . '">';
-$tabs = ['general' => 'admin_settings', 'ai' => 'tab_ai', 'turnstile' => 'tab_turnstile',
+$tabs = ['general' => 'tab_general', 'ai' => 'tab_ai', 'turnstile' => 'tab_turnstile',
          'users' => 'tab_users', 'categories' => 'tab_categories', 'audit' => 'tab_audit'];
 ?>
 <div style="margin-bottom:.75rem"><h1 style="margin:0;font-size:1.75rem"><?= e(t('admin_panel')) ?></h1></div>
@@ -2094,29 +2427,121 @@ $tabs = ['general' => 'admin_settings', 'ai' => 'tab_ai', 'turnstile' => 'tab_tu
 </div>
 
 <?php elseif ($tab === 'ai'): ?>
-<div class="glass card">
+<div class="glass card" style="margin-bottom:1.25rem">
   <h2 class="sec-title"><?= e(t('tab_ai')) ?></h2>
-  <form method="post" action="/admin.php" class="grid">
-    <?= csrf_field() ?><input type="hidden" name="action" value="save_ai"><?= $tabField ?>
-    <label class="flex"><input type="checkbox" name="ai_enabled" value="1" <?= settings_get($db, 'ai_enabled', '0') === '1' ? 'checked' : '' ?>> <span><?= e(t('ai_enabled')) ?></span></label>
-    <label class="field"><span><?= e(t('ai_provider')) ?></span>
-      <select name="ai_provider">
-        <?php $prov = settings_get($db, 'ai_provider', 'anthropic');
-        foreach (['anthropic' => 'Anthropic', 'openai' => 'OpenAI'] as $k => $lbl): ?>
-          <option value="<?= e($k) ?>" <?= $prov === $k ? 'selected' : '' ?>><?= e($lbl) ?></option>
-        <?php endforeach; ?>
-      </select>
-    </label>
-    <label class="field"><span><?= e(t('ai_model')) ?></span>
-      <input name="ai_model" maxlength="64" value="<?= e(settings_get($db, 'ai_model', '')) ?>">
-    </label>
-    <label class="field"><span><?= e(t('ai_api_key')) ?></span>
-      <input name="ai_api_key" type="password" autocomplete="new-password"
-             placeholder="<?= settings_get($db, 'ai_api_key_enc', '') !== '' ? e(t('ai_key_saved')) : '' ?>">
-    </label>
-    <div><button type="submit"><?= e(t('save')) ?></button></div>
+  <form method="post" action="/admin.php" class="flex flex-wrap">
+    <?= csrf_field() ?><input type="hidden" name="action" value="save_ai_global"><?= $tabField ?>
+    <label class="flex"><input type="checkbox" name="ai_enabled" value="1" <?= $aiEnabled === '1' ? 'checked' : '' ?>> <span><?= e(t('ai_global')) ?></span></label>
+    <button type="submit"><?= e(t('save')) ?></button>
   </form>
   <p class="hint"><?= e(t('ai_hint')) ?></p>
+  <p class="hint"><?= e(t('ai_key_hint')) ?></p>
+</div>
+
+<div class="glass card" style="margin-bottom:1.25rem">
+  <h2 class="sec-title"><?= e(t('ai_providers')) ?></h2>
+  <div class="grid">
+    <?php foreach ($providers as $pv): ?>
+      <form method="post" action="/admin.php" class="grid" style="border:1px solid var(--border);border-radius:.75rem;padding:1rem">
+        <?= csrf_field() ?><input type="hidden" name="action" value="save_provider"><?= $tabField ?>
+        <input type="hidden" name="provider_id" value="<?= (int)$pv['id'] ?>">
+        <div class="flex flex-wrap" style="justify-content:space-between">
+          <strong><?= e($pv['name']) ?> <span class="pill"><?= e($adapters[$pv['adapter']] ?? $pv['adapter']) ?></span></strong>
+          <label class="flex"><input type="checkbox" name="enabled" value="1" <?= (int)$pv['enabled'] ? 'checked' : '' ?>> <span><?= e(t('ai_enabled')) ?></span></label>
+        </div>
+        <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+          <label class="field"><span><?= e(t('ai_base_url')) ?></span><input name="base_url" value="<?= e($pv['base_url']) ?>"></label>
+          <label class="field"><span><?= e(t('ai_default_model')) ?></span><input name="default_model" value="<?= e($pv['default_model']) ?>"></label>
+          <label class="field"><span><?= e(t('ai_api_key')) ?></span>
+            <input name="api_key" type="password" autocomplete="new-password"
+                   placeholder="<?= $pv['api_key_enc'] !== '' ? e(t('ai_key_saved')) : e(t('ai_no_key_needed')) ?>">
+          </label>
+        </div>
+        <div><button type="submit"><?= e(t('save')) ?></button></div>
+      </form>
+    <?php endforeach; ?>
+  </div>
+
+  <details style="margin-top:1.25rem">
+    <summary style="cursor:pointer;font-weight:600;color:var(--accent-400)">+ <?= e(t('ai_add_provider')) ?></summary>
+    <form method="post" action="/admin.php" class="grid" style="margin-top:1rem">
+      <?= csrf_field() ?><input type="hidden" name="action" value="add_provider"><?= $tabField ?>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
+        <input name="name" placeholder="<?= e(t('ai_provider')) ?>" required maxlength="60">
+        <input name="slug" placeholder="slug" required pattern="[a-zA-Z0-9\-]{2,32}">
+        <select name="adapter">
+          <?php foreach ($adapters as $k => $lbl): ?><option value="<?= e($k) ?>"><?= e($lbl) ?></option><?php endforeach; ?>
+        </select>
+        <input name="base_url" placeholder="https://..." required>
+        <input name="default_model" placeholder="<?= e(t('ai_model')) ?>" maxlength="100">
+      </div>
+      <div><button type="submit"><?= e(t('save')) ?></button></div>
+    </form>
+  </details>
+</div>
+
+<div class="glass card" style="margin-bottom:1.25rem">
+  <h2 class="sec-title"><?= e(t('ai_profiles')) ?></h2>
+  <?php if (empty($profiles)): ?>
+    <p class="muted"><?= e(t('no_results')) ?></p>
+  <?php else: ?>
+  <div style="overflow-x:auto;margin-bottom:1.25rem">
+    <table>
+      <thead><tr><th><?= e(t('ai_profile_name')) ?></th><th><?= e(t('ai_provider')) ?></th><th><?= e(t('ai_model')) ?></th><th><?= e(t('ai_category')) ?></th><th><?= e(t('status')) ?></th><th></th></tr></thead>
+      <tbody>
+        <?php foreach ($profiles as $pf): ?>
+          <tr>
+            <td><strong><?= e($pf['name']) ?></strong></td>
+            <td><?= e($pf['provider_name']) ?></td>
+            <td><code><?= e($pf['model'] !== '' ? $pf['model'] : $pf['default_model']) ?></code></td>
+            <td><?= e($pf['cat_name'] ?? t('all')) ?></td>
+            <td><?= (int)$pf['enabled'] ? '✓' : '—' ?></td>
+            <td>
+              <div class="flex" style="gap:.35rem">
+                <a href="/admin.php?tab=ai&amp;edit_profile=<?= (int)$pf['id'] ?>" class="btn btn-ghost btn-sm"><?= e(t('edit')) ?></a>
+                <form method="post" action="/admin.php" style="margin:0" data-confirm="<?= e(t('delete_confirm')) ?>">
+                  <?= csrf_field() ?><input type="hidden" name="action" value="delete_profile"><?= $tabField ?>
+                  <input type="hidden" name="profile_id" value="<?= (int)$pf['id'] ?>">
+                  <button class="btn-danger btn btn-sm" type="submit">🗑</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+      </tbody>
+    </table>
+  </div>
+  <?php endif; ?>
+
+  <h3 style="margin:0 0 .75rem;font-size:1rem"><?= e($editProfile ? t('ai_edit_profile') : t('ai_add_profile')) ?></h3>
+  <form method="post" action="/admin.php" class="grid">
+    <?= csrf_field() ?><input type="hidden" name="action" value="save_profile"><?= $tabField ?>
+    <input type="hidden" name="profile_id" value="<?= (int)($editProfile['id'] ?? 0) ?>">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
+      <label class="field"><span><?= e(t('ai_profile_name')) ?></span>
+        <input name="name" required maxlength="60" value="<?= e($editProfile['name'] ?? '') ?>"></label>
+      <label class="field"><span><?= e(t('ai_provider')) ?></span>
+        <select name="provider_id" required>
+          <?php foreach ($providers as $pv): ?>
+            <option value="<?= (int)$pv['id'] ?>" <?= (int)($editProfile['provider_id'] ?? 0) === (int)$pv['id'] ? 'selected' : '' ?>><?= e($pv['name']) ?></option>
+          <?php endforeach; ?>
+        </select></label>
+      <label class="field"><span><?= e(t('ai_model')) ?> <small>(<?= e(t('ai_model_hint')) ?>)</small></span>
+        <input name="model" maxlength="100" value="<?= e($editProfile['model'] ?? '') ?>"></label>
+      <label class="field"><span><?= e(t('ai_category')) ?></span>
+        <select name="category_id">
+          <option value="">— <?= e(t('all')) ?> —</option>
+          <?php foreach ($catsAll as $c): ?>
+            <option value="<?= (int)$c['id'] ?>" <?= (int)($editProfile['category_id'] ?? 0) === (int)$c['id'] ? 'selected' : '' ?>><?= e($c['name_en']) ?> / <?= e($c['name_tr']) ?></option>
+          <?php endforeach; ?>
+        </select></label>
+    </div>
+    <label class="field"><span><?= e(t('ai_system_prompt')) ?></span>
+      <textarea name="system_prompt" rows="4" required maxlength="4000"><?= e($editProfile['system_prompt'] ?? '') ?></textarea></label>
+    <label class="flex"><input type="checkbox" name="enabled" value="1" <?= !isset($editProfile) || (int)($editProfile['enabled'] ?? 0) ? 'checked' : '' ?>> <span><?= e(t('ai_enabled')) ?></span></label>
+    <div class="flex"><button type="submit"><?= e(t('save')) ?></button>
+      <?php if ($editProfile): ?><a href="/admin.php?tab=ai" class="btn btn-ghost"><?= e(t('back')) ?></a><?php endif; ?></div>
+  </form>
 </div>
 
 <?php elseif ($tab === 'turnstile'): ?>
@@ -2366,7 +2791,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); exit; }
 csrf_verify();
 $l = $_POST['lang'] ?? '';
 if (in_array($l, $config['available_langs'], true)) { $_SESSION['ui_lang'] = $l; }
-redirect($_SERVER['HTTP_REFERER'] ?? '/');
+redirect(safe_next((string)parse_url($_SERVER['HTTP_REFERER'] ?? '/', PHP_URL_PATH)));
 PHP
 
   cat > "$APP_DIR/public/login.php" <<'PHP'
@@ -2512,7 +2937,10 @@ $slug = trim((string)($_GET['slug'] ?? ''));
 if ($slug === '') { http_response_code(400); exit('Missing slug'); }
 $st = $db->prepare('SELECT * FROM categories WHERE slug = ?');
 $st->execute([$slug]); $cat = $st->fetch();
-if (!$cat) { http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean(); $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit; }
+if (!$cat) {
+  http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean();
+  $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit;
+}
 $page = max(1, (int)($_GET['page'] ?? 1));
 $per = 25; $off = ($page - 1) * $per;
 $tagSlug = trim((string)($_GET['tag'] ?? ''));
@@ -2549,9 +2977,13 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/app/bootstrap.php';
 $id = (int)($_GET['id'] ?? 0);
 if ($id <= 0) { http_response_code(400); exit('Missing id'); }
-$tst = $db->prepare('SELECT t.*, u.username, u.is_verified, c.slug AS cat_slug FROM topics t JOIN users u ON u.id = t.user_id JOIN categories c ON c.id = t.category_id WHERE t.id = ?');
+$tst = $db->prepare('SELECT t.*, u.username, u.is_verified, c.slug AS cat_slug
+                     FROM topics t JOIN users u ON u.id = t.user_id JOIN categories c ON c.id = t.category_id WHERE t.id = ?');
 $tst->execute([$id]); $topic = $tst->fetch();
-if (!$topic) { http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean(); $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit; }
+if (!$topic) {
+  http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean();
+  $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit;
+}
 
 $skey = 'viewed_' . $id;
 if (empty($_SESSION[$skey])) {
@@ -2589,7 +3021,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $u) {
         $db->prepare('UPDATE topics SET updated_at = ? WHERE id = ?')->execute([time(), $id]);
         notif_for_mentions($db, $body, $id, $newPostId, (int)$u['id']);
         notif_for_replies($db, $id, $newPostId, (int)$u['id'], $body);
-        ai_enqueue($db, $id, $newPostId, (int)$u['id']);
+        ai_enqueue($db, $id, $newPostId, (int)$u['id'], (int)$topic['category_id']);
       } else {
         flash_set('err', t('post_too_fast'));
       }
@@ -2637,7 +3069,10 @@ $u = auth_require();
 $catId = (int)($_GET['cat'] ?? 0);
 $st = $db->prepare('SELECT * FROM categories WHERE id = ?');
 $st->execute([$catId]); $cat = $st->fetch();
-if (!$cat) { http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean(); $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit; }
+if (!$cat) {
+  http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean();
+  $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit;
+}
 $error = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   csrf_verify();
@@ -2657,7 +3092,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
          ->execute([$tid, (int)$u['id'], $body, time(), time()]);
       $newPostId = (int)$db->lastInsertId();
       tags_save($db, $tid, $catId, array_map('intval', (array)($_POST['tags'] ?? [])));
-      ai_enqueue($db, $tid, $newPostId, (int)$u['id']);
+      ai_enqueue($db, $tid, $newPostId, (int)$u['id'], $catId);
       redirect('/topic.php?id=' . $tid);
     }
   }
@@ -2747,9 +3182,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       redirect('/settings.php');
     }
   }
+  $row = $db->prepare('SELECT * FROM users WHERE id = ?'); $row->execute([(int)$u['id']]); $user = $row->fetch();
 }
-$user = $db->prepare('SELECT * FROM users WHERE id = ?');
-$user->execute([(int)$u['id']]); $user = $user->fetch();
 $title = t('settings');
 ob_start(); require LF_ROOT . '/views/settings.php'; $content = ob_get_clean();
 require LF_ROOT . '/views/layout.php';
@@ -2763,7 +3197,10 @@ $uname = trim((string)($_GET['u'] ?? ''));
 if ($uname === '') { http_response_code(400); exit('Missing username'); }
 $st = $db->prepare('SELECT * FROM users WHERE username = ?');
 $st->execute([$uname]); $profile = $st->fetch();
-if (!$profile) { http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean(); $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit; }
+if (!$profile) {
+  http_response_code(404); ob_start(); require LF_ROOT . '/views/404.php'; $content = ob_get_clean();
+  $title = t('not_found'); require LF_ROOT . '/views/layout.php'; exit;
+}
 $tst = $db->prepare('SELECT t.*, c.slug AS cat_slug, c.name_en, c.name_tr, c.name_fr, c.name_de, c.name_es, c.name_ar
                      FROM topics t JOIN categories c ON c.id = t.category_id WHERE t.user_id = ? ORDER BY t.updated_at DESC LIMIT 20');
 $tst->execute([(int)$profile['id']]); $topics = $tst->fetchAll();
@@ -2952,6 +3389,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $tab = in_array($_GET['tab'] ?? '', ADMIN_TABS, true) ? $_GET['tab'] : 'general';
 $users = []; $roles = []; $cats = []; $catTags = []; $audit = []; $editCat = null;
+$providers = []; $profiles = []; $catsAll = []; $editProfile = null; $aiEnabled = '0';
+$adapters = ai_adapters();
+
 if ($tab === 'users') {
   $users = $db->query('SELECT id, username, email, role, banned, is_verified FROM users ORDER BY id DESC LIMIT 200')->fetchAll();
   $roles = $db->query('SELECT * FROM roles ORDER BY power_level DESC, id')->fetchAll();
@@ -2964,6 +3404,20 @@ if ($tab === 'categories') {
   if (!empty($_GET['edit_cat'])) {
     $st = $db->prepare('SELECT * FROM categories WHERE id = ?');
     $st->execute([(int)$_GET['edit_cat']]); $editCat = $st->fetch() ?: null;
+  }
+}
+if ($tab === 'ai') {
+  $aiEnabled = settings_get($db, 'ai_enabled', '0');
+  $providers = $db->query('SELECT * FROM ai_providers ORDER BY builtin DESC, id')->fetchAll();
+  $catsAll   = $db->query('SELECT id, name_en, name_tr FROM categories ORDER BY position, id')->fetchAll();
+  $profiles  = $db->query('SELECT p.*, pr.name AS provider_name, pr.default_model, c.name_en AS cat_name
+                           FROM ai_profiles p
+                           JOIN ai_providers pr ON pr.id = p.provider_id
+                           LEFT JOIN categories c ON c.id = p.category_id
+                           ORDER BY p.id')->fetchAll();
+  if (!empty($_GET['edit_profile'])) {
+    $st = $db->prepare('SELECT * FROM ai_profiles WHERE id = ?');
+    $st->execute([(int)$_GET['edit_profile']]); $editProfile = $st->fetch() ?: null;
   }
 }
 if ($tab === 'audit') {
@@ -3064,7 +3518,6 @@ PHP
 }
 
 write_env() {
-  # PUBLIC_BASE, tünel/TLS kurulumundan sonra hesaplanır
   cat > "$APP_DIR/config/config.php" <<PHP
 <?php
 return [
@@ -3215,7 +3668,7 @@ HTTP
     ok "TLS certificate issued"
     systemctl enable --now certbot.timer >/dev/null 2>&1 || true
   else
-    warn "Certbot failed — continuing with HTTP (check DNS for $DOMAIN)"
+    warn "Certbot failed, continuing with HTTP (check DNS for $DOMAIN)"
     SKIP_TLS=1
   fi
   rm -f /etc/nginx/sites-enabled/liteforum.http
@@ -3228,7 +3681,19 @@ write_nginx() {
   HAS_TLS=0
   if [[ $SKIP_TLS -eq 0 && -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then HAS_TLS=1; fi
 
-  # Ortak kurallar (server bloğu içine include edilir)
+  cat > /etc/nginx/conf.d/liteforum-zones.conf <<'ZONES'
+limit_req_zone $binary_remote_addr zone=lf_login:10m rate=10r/m;
+ZONES
+
+  cat > /etc/nginx/liteforum-fcgi.conf <<FCGI
+try_files \$uri =404;
+fastcgi_pass unix:$SOCK;
+include fastcgi_params;
+fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+fastcgi_param HTTP_PROXY "";
+fastcgi_read_timeout 30s;
+FCGI
+
   cat > /etc/nginx/liteforum-common.conf <<NGINX
 add_header Content-Security-Policy "$CSP" always;
 add_header X-Frame-Options "DENY" always;
@@ -3249,19 +3714,6 @@ location ~ /\.(?!well-known) { deny all; }
 location ~* \.(env|log|sqlite|db|sql|bak|ini|conf|md|git)\$ { deny all; }
 location ~ /(config|app|lang|views|storage)/ { deny all; }
 NGINX
-
-  cat > /etc/nginx/liteforum-fcgi.conf <<FCGI
-try_files \$uri =404;
-fastcgi_pass unix:$SOCK;
-include fastcgi_params;
-fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-fastcgi_param HTTP_PROXY "";
-fastcgi_read_timeout 30s;
-FCGI
-
-  cat > /etc/nginx/conf.d/liteforum-zones.conf <<'ZONES'
-limit_req_zone $binary_remote_addr zone=lf_login:10m rate=10r/m;
-ZONES
 
   if [[ $HAS_TLS -eq 1 ]]; then
     cat > /etc/nginx/sites-available/liteforum <<NGINX
@@ -3371,7 +3823,7 @@ UNIT
     sleep 2
   done
   if [[ -n "$CF_URL" ]]; then ok "Cloudflare quick tunnel: $CF_URL"
-  else warn "Tunnel URL not found — check: journalctl -u liteforum-cloudflared -n 50"; fi
+  else warn "Tunnel URL not found. Check: journalctl -u liteforum-cloudflared -n 50"; fi
 }
 
 setup_cf_named() {
@@ -3400,7 +3852,7 @@ UNIT
   if wait_tunnel_log "Registered tunnel connection"; then
     ok "Cloudflare named tunnel connected"
   else
-    warn "Tunnel connection not confirmed — check: journalctl -u liteforum-cloudflared -n 50"
+    warn "Tunnel connection not confirmed. Check: journalctl -u liteforum-cloudflared -n 50"
   fi
 }
 
@@ -3465,7 +3917,7 @@ UNIT
   if wait_tunnel_log "Registered tunnel connection"; then
     ok "Cloudflare tunnel connected → https://$DOMAIN"
   else
-    warn "Tunnel connection not confirmed — check: journalctl -u liteforum-cloudflared -n 50"
+    warn "Tunnel connection not confirmed. Check: journalctl -u liteforum-cloudflared -n 50"
   fi
 }
 
@@ -3516,12 +3968,34 @@ INSERT INTO categories(slug, name_tr, name_en, name_fr, name_de, name_es, name_a
  ('general','Genel','General','Général','Allgemein','General','عام','Genel tartışmalar','General discussions','💬',10),
  ('announcements','Duyurular','Announcements','Annonces','Ankündigungen','Anuncios','إعلانات','Resmi duyurular','Official announcements','📢',20),
  ('support','Destek','Support','Support','Hilfe','Soporte','دعم','Yardım ve destek','Help and support','🛠️',30);
+
 INSERT INTO users(username, email, password_hash, role, created_at, last_seen_at, is_verified)
 VALUES('admin', '$ADMIN_EMAIL', '$HASH', 'admin', strftime('%s','now'), strftime('%s','now'), 1);
+
+INSERT INTO ai_providers(slug, name, adapter, base_url, default_model, enabled, builtin) VALUES
+ ('anthropic','Anthropic','anthropic','https://api.anthropic.com','claude-haiku-4-5',1,1),
+ ('openai','OpenAI','openai','https://api.openai.com/v1','gpt-4o-mini',1,1),
+ ('gemini','Google Gemini','gemini','https://generativelanguage.googleapis.com/v1beta','gemini-2.5-flash',1,1),
+ ('groq','Groq','groq','https://api.groq.com/openai/v1','llama-3.3-70b-versatile',1,1),
+ ('openrouter','OpenRouter','openrouter','https://openrouter.ai/api/v1','openai/gpt-4o-mini',1,1),
+ ('mistral','Mistral','mistral','https://api.mistral.ai/v1','mistral-small-latest',1,1),
+ ('together','Together AI','together','https://api.together.xyz/v1','meta-llama/Llama-3.3-70B-Instruct-Turbo',1,1),
+ ('deepseek','DeepSeek','deepseek','https://api.deepseek.com','deepseek-chat',1,1),
+ ('cohere','Cohere','cohere','https://api.cohere.com','command-a-03-2025',1,1),
+ ('ollama','Ollama (local)','ollama','http://127.0.0.1:11434','llama3.2',0,1),
+ ('custom','Custom OpenAI-compatible','openai_compat','','',0,1);
+
+INSERT INTO users(username, email, password_hash, role, created_at, last_seen_at, is_verified)
+VALUES('assistant_$BOT_SUFFIX', 'ai+$BOT_SUFFIX@liteforum.invalid', '!', 'member', strftime('%s','now'), strftime('%s','now'), 1);
+
+INSERT INTO ai_profiles(name, provider_id, model, system_prompt, category_id, user_id, enabled, created_at) VALUES
+ ('Assistant', (SELECT id FROM ai_providers WHERE slug = 'anthropic'), '',
+  'You are the forum assistant. Keep replies short, clear, and polite.', NULL,
+  (SELECT id FROM users WHERE username = 'assistant_$BOT_SUFFIX'), 0, strftime('%s','now'));
 SQL
   chown "$SVC_USER:$SVC_USER" "$DB"* 2>/dev/null || true
   chmod 0600 "$DB"* 2>/dev/null || true
-  ok "Seed data (categories, admin)"
+  ok "Seed data (categories, admin, AI providers, default profile)"
 }
 
 verify_site() {
@@ -3531,7 +4005,7 @@ verify_site() {
     if curl -fsS -H "Host: $DOMAIN" "$base$path" -o /dev/null 2>/dev/null; then
       ok "HTTP $path"
     else
-      warn "HTTP $path FAILED — check $LOG_DIR/error.log"
+      warn "HTTP $path FAILED. Check $LOG_DIR/error.log"
     fi
   done
 }
@@ -3551,7 +4025,7 @@ EOF
   exit 0
 }
 
-# ---- Akış ----
+# ---- Flow ----
 preflight
 detect_os
 install_packages
